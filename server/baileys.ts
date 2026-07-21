@@ -1,10 +1,4 @@
-import makeWASocket, { 
-  useMultiFileAuthState, 
-  DisconnectReason, 
-  fetchLatestBaileysVersion, 
-  delay,
-  jidNormalizedUser
-} from '@whiskeysockets/baileys';
+import * as BaileysModule from '@whiskeysockets/baileys';
 import pino from 'pino';
 import fs from 'fs';
 import path from 'path';
@@ -12,6 +6,21 @@ import { Boom } from '@hapi/boom';
 import { getSessions, saveSessions, addLog, Session, getAntiDelete, getFirestoreDb } from './db';
 import { handleIncomingMessage, handleDeletedMessage, unwrapMessage } from './commands';
 import { collection, doc, getDocs, setDoc, deleteDoc, query, where } from 'firebase/firestore';
+
+// Robust resolver for Baileys module to support both ESM and bundled CommonJS environments
+const makeWASocket = (() => {
+  if (typeof BaileysModule === 'function') return BaileysModule;
+  if (BaileysModule.default && typeof BaileysModule.default === 'function') return BaileysModule.default;
+  if ((BaileysModule.default as any)?.default && typeof (BaileysModule.default as any).default === 'function') return (BaileysModule.default as any).default;
+  if ((BaileysModule as any).makeWASocket) return (BaileysModule as any).makeWASocket;
+  return BaileysModule;
+})() as any;
+
+const useMultiFileAuthState = BaileysModule.useMultiFileAuthState || (BaileysModule.default as any)?.useMultiFileAuthState;
+const DisconnectReason = BaileysModule.DisconnectReason || (BaileysModule.default as any)?.DisconnectReason;
+const fetchLatestBaileysVersion = BaileysModule.fetchLatestBaileysVersion || (BaileysModule.default as any)?.fetchLatestBaileysVersion;
+const delay = BaileysModule.delay || (BaileysModule.default as any)?.delay;
+const jidNormalizedUser = BaileysModule.jidNormalizedUser || (BaileysModule.default as any)?.jidNormalizedUser;
 
 const SESSIONS_DIR = path.join(process.cwd(), 'data', 'baileys_sessions');
 
