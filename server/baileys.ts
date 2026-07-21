@@ -26,7 +26,105 @@ export function setIoInstance(io: any) {
   ioInstance = io;
 }
 
-const syncDebounceTimers = new Map<string, NodeJS.Timeout>();
+// Optimized caching and queueing for Firestore session sync to avoid rate limits and file errors
+const lastSyncedContents = new Map<string, Map<string, string>>();
+const syncQueues = new Map<string, SessionSyncQueue>();
+const reconnectAttempts = new Map<string, number>();
+
+class SessionSyncQueue {
+  private userId: string;
+  private isSyncing = false;
+  private hasPending = false;
+  private lastSyncTime = 0;
+  private timeout: NodeJS.Timeout | null = null;
+
+  constructor(userId: string) {
+    this.userId = userId;
+  }
+
+  public trigger() {
+    if (this.timeout) {
+      clearTimeout(this.timeout);
+      this.timeout = null;
+    }
+
+    const now = Date.now();
+    const timeSinceLastSync = now - this.lastSyncTime;
+    const minInterval = 2000; // Minimum 2 seconds between full syncs to avoid Firestore write-spam
+
+    if (timeSinceLastSync >= minInterval) {
+      this.execute();
+    } else {
+      const delayTime = minInterval - timeSinceLastSync;
+      this.timeout = setTimeout(() => {
+        this.execute();
+      }, delayTime);
+    }
+  }
+
+  private async execute() {
+    if (this.isSyncing) {
+      this.hasPending = true;
+      return;
+    }
+
+    this.isSyncing = true;
+    this.hasPending = false;
+    this.lastSyncTime = Date.now();
+
+    try {
+      await syncSessionToFirestore(this.userId);
+    } catch (err) {
+      console.error(`[SessionSyncQueue] Error during sync for ${this.userId}:`, err);
+    } finally {
+      this.isSyncing = false;
+      if (this.hasPending) {
+        this.trigger();
+      }
+    }
+  }
+
+  public forceCancel() {
+    if (this.timeout) {
+      clearTimeout(this.timeout);
+      this.timeout = null;
+    }
+  }
+}
+
+export async function syncSingleFileToFirestore(userId: string, filename: string): Promise<void> {
+  const firestoreDb = getFirestoreDb();
+  if (!firestoreDb) return;
+  const sessionPath = getSessionPath(userId);
+  const filePath = path.join(sessionPath, filename);
+  if (!fs.existsSync(filePath)) return;
+
+  try {
+    const content = fs.readFileSync(filePath, 'utf-8');
+    
+    // Check in-memory cache to prevent redundant writes
+    const userCache = lastSyncedContents.get(userId) || new Map<string, string>();
+    if (!lastSyncedContents.has(userId)) {
+      lastSyncedContents.set(userId, userCache);
+    }
+    if (userCache.get(filename) === content) {
+      return;
+    }
+
+    const docId = `${userId}_${filename.replace(/\./g, '_')}`;
+    await setDoc(doc(firestoreDb, 'baileys_auth_files', docId), {
+      userId,
+      filename,
+      content,
+      updatedAt: Date.now()
+    });
+    
+    userCache.set(filename, content);
+    console.log(`[SessionSync] Immediately synced critical file ${filename} to Firestore for ${userId}.`);
+  } catch (err) {
+    console.error(`[SessionSync] Error immediately syncing ${filename} to Firestore for ${userId}:`, err);
+  }
+}
 
 export async function syncSessionFromFirestore(userId: string): Promise<void> {
   const firestoreDb = getFirestoreDb();
@@ -45,12 +143,19 @@ export async function syncSessionFromFirestore(userId: string): Promise<void> {
       return;
     }
 
+    // Get or initialize user cache
+    const userCache = lastSyncedContents.get(userId) || new Map<string, string>();
+    if (!lastSyncedContents.has(userId)) {
+      lastSyncedContents.set(userId, userCache);
+    }
+
     let count = 0;
     querySnapshot.forEach((docSnap) => {
       const data = docSnap.data();
       if (data && data.filename && data.content) {
         const filePath = path.join(sessionPath, data.filename);
         fs.writeFileSync(filePath, data.content, 'utf-8');
+        userCache.set(data.filename, data.content);
         count++;
       }
     });
@@ -70,6 +175,12 @@ export async function syncSessionToFirestore(userId: string): Promise<void> {
     
     console.log(`[SessionSync] Uploading up to ${localFiles.length} session files to Firestore for ${userId}...`);
 
+    // Get or initialize user cache
+    const userCache = lastSyncedContents.get(userId) || new Map<string, string>();
+    if (!lastSyncedContents.has(userId)) {
+      lastSyncedContents.set(userId, userCache);
+    }
+
     const localFileSet = new Set<string>();
     for (const filename of localFiles) {
       const filePath = path.join(sessionPath, filename);
@@ -82,6 +193,11 @@ export async function syncSessionToFirestore(userId: string): Promise<void> {
         const content = fs.readFileSync(filePath, 'utf-8');
         localFileSet.add(filename);
         
+        // Skip upload if content matches the cached version
+        if (userCache.get(filename) === content) {
+          continue;
+        }
+        
         const docId = `${userId}_${filename.replace(/\./g, '_')}`;
         await setDoc(doc(firestoreDb, 'baileys_auth_files', docId), {
           userId,
@@ -89,6 +205,8 @@ export async function syncSessionToFirestore(userId: string): Promise<void> {
           content,
           updatedAt: Date.now()
         });
+        
+        userCache.set(filename, content);
       } catch (readErr: any) {
         if (readErr.code === 'ENOENT') {
           console.log(`[SessionSync] File ${filename} vanished during read. Skipping.`);
@@ -109,6 +227,7 @@ export async function syncSessionToFirestore(userId: string): Promise<void> {
         if (!localFileSet.has(data.filename) && !fs.existsSync(localFilePath)) {
           console.log(`[SessionSync] Deleting obsolete cloud file ${data.filename} from Firestore for ${userId}...`);
           await deleteDoc(docSnap.ref);
+          userCache.delete(data.filename);
         }
       }
     }
@@ -120,20 +239,12 @@ export async function syncSessionToFirestore(userId: string): Promise<void> {
 }
 
 export function triggerSessionSyncToFirestore(userId: string) {
-  const firestoreDb = getFirestoreDb();
-  if (!firestoreDb) return;
-  
-  const existingTimer = syncDebounceTimers.get(userId);
-  if (existingTimer) {
-    clearTimeout(existingTimer);
+  let queue = syncQueues.get(userId);
+  if (!queue) {
+    queue = new SessionSyncQueue(userId);
+    syncQueues.set(userId, queue);
   }
-  
-  const timer = setTimeout(async () => {
-    syncDebounceTimers.delete(userId);
-    await syncSessionToFirestore(userId);
-  }, 3000);
-  
-  syncDebounceTimers.set(userId, timer);
+  queue.trigger();
 }
 
 // Helper to get session directory
@@ -249,11 +360,11 @@ export async function disconnectWhatsApp(userId: string, email: string) {
     }
   }
 
-  // Clear debounce timer if active
-  const existingTimer = syncDebounceTimers.get(userId);
-  if (existingTimer) {
-    clearTimeout(existingTimer);
-    syncDebounceTimers.delete(userId);
+  // Clear any pending sync queues
+  const existingQueue = syncQueues.get(userId);
+  if (existingQueue) {
+    existingQueue.forceCancel();
+    syncQueues.delete(userId);
   }
 
   // Delete session files from Firestore
@@ -322,6 +433,7 @@ export async function initWhatsAppSession(
   // Intercept credentials and key updates to synchronize with Firestore
   const customSaveCreds = async () => {
     await saveCreds();
+    await syncSingleFileToFirestore(userId, 'creds.json');
     triggerSessionSyncToFirestore(userId);
   };
 
@@ -331,7 +443,15 @@ export async function initWhatsAppSession(
     triggerSessionSyncToFirestore(userId);
   };
 
-  const { version } = await fetchLatestBaileysVersion();
+  let version: any = [2, 3000, 1017004407]; // Modern stable Baileys version fallback
+  try {
+    const latest = await fetchLatestBaileysVersion();
+    if (latest && latest.version) {
+      version = latest.version;
+    }
+  } catch (err) {
+    console.warn('[Baileys] Failed to fetch latest version, using fallback:', err);
+  }
 
   // If there's an existing socket, clean it up first and remove all listeners to prevent ghost reconnection loops
   const existingSock = activeSockets.get(userId);
@@ -433,11 +553,11 @@ export async function initWhatsAppSession(
     }
 
     if (connection === 'close') {
-      // Check if this socket has been superseded or removed.
-      // If activeSockets.get(userId) is a different socket, we should ignore this event.
+      // Check if this socket has been superseded or removed from activeSockets.
+      // If activeSockets.get(userId) is not this exact socket, we should ignore this event.
       const currentSock = activeSockets.get(userId);
-      if (currentSock && currentSock !== sock) {
-        console.log(`Ignoring close event for superseded socket of user ${userId}`);
+      if (currentSock !== sock) {
+        console.log(`Ignoring close event for non-active or superseded socket of user ${userId}`);
         return;
       }
 
@@ -511,22 +631,29 @@ export async function initWhatsAppSession(
           });
         }
       } else {
-        // Reconnect after delay
+        // Reconnect after delay with exponential back-off
+        const attempts = reconnectAttempts.get(userId) || 0;
+        reconnectAttempts.set(userId, attempts + 1);
+        
+        const delayMs = Math.min(5000 * Math.pow(1.5, attempts), 60000);
+        console.log(`[Reconnection] Scheduling reconnect attempt ${attempts + 1} for ${userId} in ${Math.round(delayMs)}ms...`);
+        
         if (ioInstance) {
-          ioInstance.to(userId).emit('wa-status', { status: 'connecting', message: 'Reconnecting...' });
-          ioInstance.to('admin').emit('admin-session-update', { userId, status: 'connecting', message: 'Reconnecting...', email });
+          ioInstance.to(userId).emit('wa-status', { status: 'connecting', message: `Reconnecting (Attempt ${attempts + 1})...` });
+          ioInstance.to('admin').emit('admin-session-update', { userId, status: 'connecting', message: `Reconnecting (Attempt ${attempts + 1})...`, email });
         }
-        await delay(5000);
+        await delay(delayMs);
 
-        // Before executing reconnect, verify if a new session was established during the delay
-        if (activeSockets.has(userId)) {
-          console.log(`A new session was established for user ${userId} during the reconnect delay. Aborting reconnect loop.`);
+        // Before executing reconnect, verify if a new socket session was established during the delay
+        if (activeSockets.has(userId) && activeSockets.get(userId) !== sock) {
+          console.log(`A newer active session exists for user ${userId} during the reconnect delay. Aborting older reconnect loop.`);
           return;
         }
 
         initWhatsAppSession(userId, email, useQr);
       }
     } else if (connection === 'open') {
+      reconnectAttempts.delete(userId);
       let connectedPhone = '';
       if (sock.user?.id) {
         const normalized = jidNormalizedUser(sock.user.id);
@@ -736,3 +863,34 @@ export async function autoConnectAllSessions() {
     }
   }
 }
+
+// Graceful shutdown helpers to flush any pending session updates on exit
+async function flushAllSyncQueues() {
+  console.log('[Shutdown] Gracefully flushing all pending session syncs to Firestore...');
+  const activeUserIds = Array.from(syncQueues.keys());
+  for (const userId of activeUserIds) {
+    const queue = syncQueues.get(userId);
+    if (queue) {
+      queue.forceCancel();
+      try {
+        console.log(`[Shutdown] Force syncing session to Firestore for user: ${userId}`);
+        await syncSessionToFirestore(userId);
+      } catch (err) {
+        console.error(`[Shutdown] Failed to sync session for ${userId} during shutdown:`, err);
+      }
+    }
+  }
+  console.log('[Shutdown] All pending syncs completed.');
+}
+
+process.on('SIGTERM', async () => {
+  console.log('SIGTERM received. Cleaning up...');
+  await flushAllSyncQueues();
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('SIGINT received. Cleaning up...');
+  await flushAllSyncQueues();
+  process.exit(0);
+});
