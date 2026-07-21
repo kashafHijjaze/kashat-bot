@@ -1,0 +1,8 @@
+{
+  "name": "Hijjaze Bot",
+  "description": "A responsive full-stack WhatsApp session and pairing code generator, featuring user dashboards, a bot control panel, and an admin management interface.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
