@@ -68,21 +68,34 @@ export async function syncSessionToFirestore(userId: string): Promise<void> {
     if (!fs.existsSync(sessionPath)) return;
     const localFiles = fs.readdirSync(sessionPath).filter(f => f.endsWith('.json'));
     
-    console.log(`[SessionSync] Uploading ${localFiles.length} session files to Firestore for ${userId}...`);
+    console.log(`[SessionSync] Uploading up to ${localFiles.length} session files to Firestore for ${userId}...`);
 
     const localFileSet = new Set<string>();
     for (const filename of localFiles) {
-      localFileSet.add(filename);
       const filePath = path.join(sessionPath, filename);
-      const content = fs.readFileSync(filePath, 'utf-8');
+      if (!fs.existsSync(filePath)) {
+        console.log(`[SessionSync] File ${filename} was deleted before we could upload. Skipping.`);
+        continue;
+      }
       
-      const docId = `${userId}_${filename.replace(/\./g, '_')}`;
-      await setDoc(doc(firestoreDb, 'baileys_auth_files', docId), {
-        userId,
-        filename,
-        content,
-        updatedAt: Date.now()
-      });
+      try {
+        const content = fs.readFileSync(filePath, 'utf-8');
+        localFileSet.add(filename);
+        
+        const docId = `${userId}_${filename.replace(/\./g, '_')}`;
+        await setDoc(doc(firestoreDb, 'baileys_auth_files', docId), {
+          userId,
+          filename,
+          content,
+          updatedAt: Date.now()
+        });
+      } catch (readErr: any) {
+        if (readErr.code === 'ENOENT') {
+          console.log(`[SessionSync] File ${filename} vanished during read. Skipping.`);
+        } else {
+          console.error(`[SessionSync] Failed to sync session file ${filename}:`, readErr);
+        }
+      }
     }
 
     // Clean up files in Firestore that are no longer present locally
@@ -91,9 +104,12 @@ export async function syncSessionToFirestore(userId: string): Promise<void> {
     
     for (const docSnap of querySnapshot.docs) {
       const data = docSnap.data();
-      if (data && data.filename && !localFileSet.has(data.filename)) {
-        console.log(`[SessionSync] Deleting obsolete cloud file ${data.filename} from Firestore for ${userId}...`);
-        await deleteDoc(docSnap.ref);
+      if (data && data.filename) {
+        const localFilePath = path.join(sessionPath, data.filename);
+        if (!localFileSet.has(data.filename) && !fs.existsSync(localFilePath)) {
+          console.log(`[SessionSync] Deleting obsolete cloud file ${data.filename} from Firestore for ${userId}...`);
+          await deleteDoc(docSnap.ref);
+        }
       }
     }
     
@@ -284,11 +300,23 @@ export async function disconnectWhatsApp(userId: string, email: string) {
 }
 
 // Main logic to initialize WhatsApp socket
-export async function initWhatsAppSession(userId: string, email: string, useQr: boolean = false, phoneToPair?: string): Promise<any> {
-  // Restore pre-existing files from cloud Firestore first
-  await syncSessionFromFirestore(userId);
-
+export async function initWhatsAppSession(
+  userId: string,
+  email: string,
+  useQr: boolean = false,
+  phoneToPair?: string,
+  forceRestoreFromCloud: boolean = false
+): Promise<any> {
   const sessionPath = getSessionPath(userId);
+  const credsPath = path.join(sessionPath, 'creds.json');
+  
+  // Restore pre-existing files from cloud Firestore only if local credentials do not exist OR forceRestoreFromCloud is true
+  if (!fs.existsSync(credsPath) || forceRestoreFromCloud) {
+    await syncSessionFromFirestore(userId);
+  } else {
+    console.log(`[SessionSync] Local session files exist for ${userId}. Skipping cloud restore during socket initialization.`);
+  }
+
   const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
 
   // Intercept credentials and key updates to synchronize with Firestore

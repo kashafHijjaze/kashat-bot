@@ -539,9 +539,17 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), 'dist');
+    const indexPath = path.join(distPath, 'index.html');
+    if (!fs.existsSync(indexPath)) {
+      console.warn(`[Server] WARNING: dist/index.html was not found at ${indexPath}! Make sure you run 'npm run build' before starting the server.`);
+    }
     app.use(express.static(distPath));
     app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+      if (fs.existsSync(indexPath)) {
+        res.sendFile(indexPath);
+      } else {
+        res.status(404).send(`index.html not found. Please ensure you run "npm run build" to build the client-side files before starting the server. Current directory: ${process.cwd()}, Files in dist folder: ${fs.existsSync(distPath) ? fs.readdirSync(distPath).join(', ') : 'no dist folder'}`);
+      }
     });
   }
 
