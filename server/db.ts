@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import bcrypt from 'bcryptjs';
 import { initializeApp } from 'firebase/app';
-import { getFirestore, collection, doc, getDocs, setDoc, query, orderBy, limit } from 'firebase/firestore';
+import { getFirestore, collection, doc, getDocs, setDoc, query, orderBy, limit, getDoc, disableNetwork, setLogLevel } from 'firebase/firestore';
 
 const DATA_DIR = path.join(process.cwd(), 'data');
 
@@ -60,12 +60,81 @@ let cachedUsers: User[] = [];
 let cachedSessions: Session[] = [];
 let cachedLogs: Log[] = [];
 
+try { setLogLevel('silent'); } catch (e) {}
+
+const QUOTA_STATUS_FILE = path.join(DATA_DIR, 'firestore_quota_status.json');
+let isFirestoreWriteDisabled = false;
+
+try {
+  if (fs.existsSync(QUOTA_STATUS_FILE)) {
+    const statusData = JSON.parse(fs.readFileSync(QUOTA_STATUS_FILE, 'utf-8'));
+    if (statusData.exhausted && statusData.timestamp) {
+      const timeSinceDetection = Date.now() - statusData.timestamp;
+      if (timeSinceDetection > 0 && timeSinceDetection < 24 * 60 * 60 * 1000) {
+        isFirestoreWriteDisabled = true;
+        console.warn('[Firestore] ⚠️ Firestore writes are suspended on boot due to cached write quota exhaustion. Operating in localized persistence mode.');
+      } else if (timeSinceDetection >= 24 * 60 * 60 * 1000) {
+        try {
+          fs.unlinkSync(QUOTA_STATUS_FILE);
+        } catch (uErr) {}
+      }
+    }
+  }
+} catch (err) {
+  // Ignore
+}
+
+export function isFirestoreQuotaExhausted(): boolean {
+  return isFirestoreWriteDisabled;
+}
+
+export function handleFirestoreError(err: any, context: string) {
+  const errMsg = err?.message || String(err);
+  const errCode = String(err?.code || '').toLowerCase();
+  if (errMsg.includes('RESOURCE_EXHAUSTED') || errMsg.includes('Quota exceeded') || errCode.includes('resource-exhausted') || errCode.includes('quota')) {
+    if (!isFirestoreWriteDisabled) {
+      isFirestoreWriteDisabled = true;
+      try { setLogLevel('silent'); } catch (e) {}
+      console.warn(`[Firestore] ⚠️ Write quota exceeded (${context}). Firestore writes have been suspended. Operating in localized persistence mode.`);
+      try {
+        fs.writeFileSync(QUOTA_STATUS_FILE, JSON.stringify({
+          exhausted: true,
+          timestamp: Date.now(),
+          context
+        }, null, 2));
+      } catch (fErr) {}
+      
+      if (firestoreDb) {
+        console.log('[Firestore] Disabling Firebase SDK network connection and releasing client reference to prevent further write RPC errors...');
+        disableNetwork(firestoreDb).catch(() => {});
+        firestoreDb = null;
+      }
+    }
+  } else {
+    console.error(`[Firestore] Error in ${context}:`, err);
+  }
+}
+
+// Track serialized states to prevent redundant / full-list Firestore writes
+const lastPersistedUsers = new Map<string, string>();
+const lastPersistedSessions = new Map<string, string>();
+
+function syncLastPersisted() {
+  lastPersistedUsers.clear();
+  cachedUsers.forEach(u => lastPersistedUsers.set(u.id, JSON.stringify(u)));
+  
+  lastPersistedSessions.clear();
+  cachedSessions.forEach(s => lastPersistedSessions.set(s.userId, JSON.stringify(s)));
+}
+
 // Initialize Firebase client SDK safely for server use
 const CONFIG_FILE = path.join(process.cwd(), 'firebase-applet-config.json');
 let firestoreDb: any = null;
 
 try {
-  if (fs.existsSync(CONFIG_FILE)) {
+  if (isFirestoreWriteDisabled) {
+    console.warn('[Firestore] ⚠️ Bypassing Firebase client SDK initialization on boot since write quota is marked as exhausted. Running in offline/localized file persistence mode.');
+  } else if (fs.existsSync(CONFIG_FILE)) {
     const config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
     if (config.projectId) {
       const app = initializeApp(config);
@@ -132,6 +201,8 @@ function loadLocalData() {
   } catch (err) {
     cachedLogs = [];
   }
+
+  syncLastPersisted();
 }
 
 // Initial sync
@@ -139,8 +210,8 @@ loadLocalData();
 
 // Async loader to sync from Firestore on boot
 export async function loadFromFirestore(): Promise<void> {
-  if (!firestoreDb) {
-    console.log('Firestore is not active, using local file databases.');
+  if (!firestoreDb || isFirestoreWriteDisabled) {
+    console.log('Firestore is not active or has been disabled, using local file databases.');
     return;
   }
   try {
@@ -159,7 +230,9 @@ export async function loadFromFirestore(): Promise<void> {
       // Seed firestore with local users
       console.log('Firestore users collection is empty. Seeding Firestore with default users.');
       for (const user of cachedUsers) {
-        await setDoc(doc(firestoreDb, 'users', user.id), cleanUndefined(user));
+        if (!isFirestoreWriteDisabled) {
+          await setDoc(doc(firestoreDb, 'users', user.id), cleanUndefined(user));
+        }
       }
     }
 
@@ -176,30 +249,42 @@ export async function loadFromFirestore(): Promise<void> {
       // Seed firestore with local sessions if any
       if (cachedSessions.length > 0) {
         for (const session of cachedSessions) {
-          await setDoc(doc(firestoreDb, 'sessions', session.userId), cleanUndefined(session));
+          if (!isFirestoreWriteDisabled) {
+            await setDoc(doc(firestoreDb, 'sessions', session.userId), cleanUndefined(session));
+          }
         }
       }
     }
 
-    // Load Logs
-    const logsSnapshot = await getDocs(query(collection(firestoreDb, 'logs'), orderBy('timestamp', 'desc'), limit(1000)));
-    if (!logsSnapshot.empty) {
-      const logs: Log[] = [];
-      logsSnapshot.forEach((doc: any) => {
-        logs.push(doc.data() as Log);
-      });
-      cachedLogs = logs;
-      console.log(`Loaded ${logs.length} logs from Firestore.`);
-    } else {
-      // Seed logs if any
-      if (cachedLogs.length > 0) {
-        for (const log of cachedLogs.slice(0, 100)) {
-          await setDoc(doc(firestoreDb, 'logs', log.id), cleanUndefined(log));
+    // Load Logs from bundled document
+    try {
+      const logDocRef = doc(firestoreDb, 'system_logs', 'all');
+      const logDocSnap = await getDoc(logDocRef);
+      if (logDocSnap.exists()) {
+        const data = logDocSnap.data();
+        if (data && Array.isArray(data.logs)) {
+          cachedLogs = data.logs;
+          console.log(`Loaded ${cachedLogs.length} logs from bundled Firestore document.`);
+        }
+      } else {
+        // Fallback: see if there are old individual logs
+        console.log('Bundled logs not found. Falling back to individual legacy Firestore logs...');
+        const logsSnapshot = await getDocs(query(collection(firestoreDb, 'logs'), orderBy('timestamp', 'desc'), limit(100)));
+        if (!logsSnapshot.empty) {
+          const logs: Log[] = [];
+          logsSnapshot.forEach((doc: any) => {
+            logs.push(doc.data() as Log);
+          });
+          cachedLogs = logs;
+          console.log(`Loaded ${logs.length} logs from legacy Firestore logs.`);
         }
       }
+    } catch (logErr) {
+      handleFirestoreError(logErr, 'loadFromFirestore (logs)');
     }
+    syncLastPersisted();
   } catch (err) {
-    console.error('Failed to load datasets from Firestore:', err);
+    handleFirestoreError(err, 'loadFromFirestore');
   }
 }
 
@@ -208,6 +293,13 @@ export function getUsers(): User[] {
 }
 
 export function saveUsers(users: User[]): void {
+  // Find which users actually changed
+  const changedUsers = users.filter(user => {
+    const serialized = JSON.stringify(user);
+    const lastSerialized = lastPersistedUsers.get(user.id);
+    return serialized !== lastSerialized;
+  });
+
   cachedUsers = users;
   try {
     fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
@@ -215,12 +307,17 @@ export function saveUsers(users: User[]): void {
     console.error('Error saving users file locally:', err);
   }
 
-  if (firestoreDb) {
-    // Save to Firestore in background
+  // Update the persistence cache
+  changedUsers.forEach(user => {
+    lastPersistedUsers.set(user.id, JSON.stringify(user));
+  });
+
+  if (firestoreDb && !isFirestoreWriteDisabled && changedUsers.length > 0) {
+    // Only save changed users to Firestore in the background
     Promise.all(
-      users.map(user => setDoc(doc(firestoreDb, 'users', user.id), cleanUndefined(user)))
+      changedUsers.map(user => setDoc(doc(firestoreDb, 'users', user.id), cleanUndefined(user)))
     ).catch(err => {
-      console.error('Failed to save users to Firestore:', err);
+      handleFirestoreError(err, 'saveUsers');
     });
   }
 }
@@ -230,6 +327,13 @@ export function getSessions(): Session[] {
 }
 
 export function saveSessions(sessions: Session[]): void {
+  // Find which sessions actually changed
+  const changedSessions = sessions.filter(sess => {
+    const serialized = JSON.stringify(sess);
+    const lastSerialized = lastPersistedSessions.get(sess.userId);
+    return serialized !== lastSerialized;
+  });
+
   cachedSessions = sessions;
   try {
     fs.writeFileSync(SESSIONS_FILE, JSON.stringify(sessions, null, 2));
@@ -237,18 +341,46 @@ export function saveSessions(sessions: Session[]): void {
     console.error('Error saving sessions file locally:', err);
   }
 
-  if (firestoreDb) {
-    // Save to Firestore in background
+  // Update the persistence cache
+  changedSessions.forEach(sess => {
+    lastPersistedSessions.set(sess.userId, JSON.stringify(sess));
+  });
+
+  if (firestoreDb && !isFirestoreWriteDisabled && changedSessions.length > 0) {
+    // Only save changed sessions to Firestore in the background
     Promise.all(
-      sessions.map(session => setDoc(doc(firestoreDb, 'sessions', session.userId), cleanUndefined(session)))
+      changedSessions.map(session => setDoc(doc(firestoreDb, 'sessions', session.userId), cleanUndefined(session)))
     ).catch(err => {
-      console.error('Failed to save sessions to Firestore:', err);
+      handleFirestoreError(err, 'saveSessions');
     });
   }
 }
 
 export function getLogs(): Log[] {
   return cachedLogs;
+}
+
+let logsSyncTimeout: NodeJS.Timeout | null = null;
+
+function triggerLogsSyncToFirestore() {
+  if (logsSyncTimeout || isFirestoreWriteDisabled) return; // Already scheduled or disabled
+  
+  logsSyncTimeout = setTimeout(async () => {
+    logsSyncTimeout = null;
+    if (firestoreDb && !isFirestoreWriteDisabled) {
+      try {
+        // Keep only top 200 logs in Firestore to keep the document size small
+        const logsToSave = cachedLogs.slice(0, 200);
+        await setDoc(doc(firestoreDb, 'system_logs', 'all'), {
+          logs: logsToSave,
+          updatedAt: new Date().toISOString()
+        });
+        console.log(`[LogSync] Successfully synced ${logsToSave.length} logs to bundled Firestore.`);
+      } catch (err) {
+        handleFirestoreError(err, 'syncLogs');
+      }
+    }
+  }, 10000); // Debounce for 10 seconds
 }
 
 export function addLog(userId: string, email: string, action: string, message: string): void {
@@ -272,9 +404,7 @@ export function addLog(userId: string, email: string, action: string, message: s
     } catch (err) {}
 
     if (firestoreDb) {
-      setDoc(doc(firestoreDb, 'logs', newLog.id), cleanUndefined(newLog)).catch((err: any) => {
-        console.error('Failed to save log entry to Firestore:', err);
-      });
+      triggerLogsSyncToFirestore();
     }
   } catch (err) {
     console.error('Error adding log:', err);
@@ -328,7 +458,47 @@ export function setAntiDelete(userId: string, enabled: boolean): void {
 }
 
 export function getFirestoreDb(): any {
+  if (isFirestoreWriteDisabled) return null;
   return firestoreDb;
+}
+
+export interface ChannelConfig {
+  name: string;
+  link: string;
+  newsletterJid: string;
+}
+
+const CHANNEL_CONFIG_FILE = path.join(DATA_DIR, 'channel_config.json');
+
+const DEFAULT_CHANNEL_CONFIG: ChannelConfig = {
+  name: 'HIJJAZE BOT OFFICIAL CHANNEL',
+  link: 'https://whatsapp.com/channel/0029Vb31A1fEquiT4S34jG1d',
+  newsletterJid: '120363426834632590@newsletter'
+};
+
+let cachedChannelConfig: ChannelConfig = DEFAULT_CHANNEL_CONFIG;
+
+try {
+  if (fs.existsSync(CHANNEL_CONFIG_FILE)) {
+    const data = JSON.parse(fs.readFileSync(CHANNEL_CONFIG_FILE, 'utf-8'));
+    cachedChannelConfig = { ...DEFAULT_CHANNEL_CONFIG, ...data };
+  }
+} catch (e) {
+  cachedChannelConfig = DEFAULT_CHANNEL_CONFIG;
+}
+
+export function getChannelConfig(): ChannelConfig {
+  return cachedChannelConfig;
+}
+
+export function setChannelConfig(config: Partial<ChannelConfig>): ChannelConfig {
+  cachedChannelConfig = { ...cachedChannelConfig, ...config };
+  try {
+    fs.writeFileSync(CHANNEL_CONFIG_FILE, JSON.stringify(cachedChannelConfig, null, 2));
+  } catch (e) {
+    console.error('Error saving channel config:', e);
+  }
+  return cachedChannelConfig;
 }
 
 

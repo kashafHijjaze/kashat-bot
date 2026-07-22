@@ -200,3 +200,142 @@ function getFallbackMimetype(msgType: string): string {
     default: return 'application/octet-stream';
   }
 }
+
+/**
+ * Silently enhances any image prompt (short/emoji/long) into a professional, ultra-HD photorealistic prompt internally
+ */
+export async function enhanceImagePrompt(userPrompt: string): Promise<string> {
+  const ai = getGeminiClient();
+  if (!ai) {
+    return buildFallbackEnhancedPrompt(userPrompt);
+  }
+
+  try {
+    const systemInstruction = `You are an expert AI Image Prompt Engineer.
+Your task is to take any input prompt (which may be a single word, emoji like "🐱" or "🕌", short phrase like "cat" or "sports car", or a long description in any language) and convert it into a single, highly detailed, vivid, professional prompt optimized for AI image generation (Imagen 3 / Flux / SDXL).
+
+Rules:
+1. Detect input language and emojis. Interpret the core subject and concept accurately.
+2. If the prompt is short or minimal (e.g., "cat 😺", "mosque", "sports car", "rose 🌹", "lion"), automatically expand it with rich details: subject traits, environment/background, cinematic lighting (golden hour, ambient, volumetric), camera setup (shallow depth of field, 85mm lens, crisp focus), color grading, 8K HDR, photorealistic textures, masterpiece quality.
+3. If the prompt is detailed or long, preserve all core ideas and meaning, but improve composition, lighting, shadows, realism, and clarity.
+4. Automatically recognize or infer suitable visual styles (e.g. Photorealistic, Digital Art, Oil Painting, Anime, Islamic Art, Fantasy, Sci-Fi, 3D Render, etc.).
+5. CRITICAL: Output ONLY the final enhanced prompt text in plain English. Do NOT add quotes, markdown formatting, explanations, or prefixes.`;
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.5-flash',
+      contents: [{ role: 'user', parts: [{ text: `Enhance this image prompt for AI generation: ${userPrompt}` }] }],
+      config: {
+        systemInstruction,
+        temperature: 0.7
+      }
+    });
+
+    const enhanced = response.text?.trim();
+    if (enhanced && enhanced.length > 5) {
+      return enhanced.replace(/^["']/g, '').replace(/["']$/g, '');
+    }
+  } catch (err) {
+    console.error('[AI] Error enhancing prompt with Gemini:', err);
+  }
+
+  return buildFallbackEnhancedPrompt(userPrompt);
+}
+
+function buildFallbackEnhancedPrompt(userPrompt: string): string {
+  const clean = userPrompt.trim();
+  if (clean.length < 30) {
+    return `${clean}, highly detailed, photorealistic photography, 8k HDR resolution, cinematic lighting, professional composition, vibrant colors, ultra HD quality, masterpiece`;
+  }
+  return `${clean}, highly detailed, photorealistic, cinematic lighting, 8k resolution, professional photography, masterpiece`;
+}
+
+/**
+ * Generate image buffer from prompt using Gemini Imagen API or Pollinations AI as free fallback
+ */
+export async function generateImageBuffer(userPrompt: string): Promise<{ buffer: Buffer; enhancedPrompt: string }> {
+  const enhancedPrompt = await enhanceImagePrompt(userPrompt);
+  console.log(`[Imagine] Original: "${userPrompt}" -> Enhanced: "${enhancedPrompt}"`);
+
+  // Try Gemini Imagen if API Key is set
+  const ai = getGeminiClient();
+  if (ai) {
+    try {
+      const response = await (ai.models as any).generateImages({
+        model: 'imagen-3.0-generate-002',
+        prompt: enhancedPrompt,
+        config: {
+          numberOfImages: 1,
+          outputMimeType: 'image/jpeg',
+          aspectRatio: '1:1',
+        }
+      });
+
+      const imageBytes = response?.generatedImages?.[0]?.image?.imageBytes;
+      if (imageBytes) {
+        const buffer = Buffer.from(imageBytes, 'base64');
+        return { buffer, enhancedPrompt };
+      }
+    } catch (err: any) {
+      console.warn('[Imagine] Gemini Imagen unavailable or failed, switching to free high-speed generator:', err?.message || err);
+    }
+  }
+
+  // Primary Free Generator: Pollinations AI (Flux model)
+  try {
+    const seed = Math.floor(Math.random() * 1000000);
+    const encodedPrompt = encodeURIComponent(enhancedPrompt);
+    const pollinationsUrl = `https://image.pollinations.ai/prompt/${encodedPrompt}?width=1024&height=1024&seed=${seed}&nologo=true&model=flux`;
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 35000);
+
+    const res = await fetch(pollinationsUrl, {
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
+      }
+    });
+    clearTimeout(timeoutId);
+
+    if (res.ok) {
+      const arrayBuffer = await res.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+      if (buffer && buffer.length > 2000) {
+        return { buffer, enhancedPrompt };
+      }
+    }
+  } catch (err: any) {
+    console.error('[Imagine] Pollinations AI Flux error:', err);
+  }
+
+  // Secondary Free Fallback: Pollinations AI (Turbo model)
+  try {
+    const seed = Math.floor(Math.random() * 1000000);
+    const encodedPrompt = encodeURIComponent(enhancedPrompt);
+    const pollinationsUrl = `https://image.pollinations.ai/prompt/${encodedPrompt}?width=1024&height=1024&seed=${seed}&nologo=true&model=turbo`;
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 25000);
+
+    const res = await fetch(pollinationsUrl, {
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      }
+    });
+    clearTimeout(timeoutId);
+
+    if (res.ok) {
+      const arrayBuffer = await res.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+      if (buffer && buffer.length > 2000) {
+        return { buffer, enhancedPrompt };
+      }
+    }
+  } catch (err: any) {
+    console.error('[Imagine] Pollinations AI Turbo fallback error:', err);
+  }
+
+  throw new Error('Unable to generate image at the moment. All image backends are currently busy.');
+}
+

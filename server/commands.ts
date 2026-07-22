@@ -1,9 +1,9 @@
-import { getBotMode, setBotMode, addLog, getAntiDelete, setAntiDelete } from './db';
+import { getBotMode, setBotMode, addLog, getAntiDelete, setAntiDelete, getChannelConfig, setChannelConfig } from './db';
 import fs from 'fs';
 import path from 'path';
 import { downloadMediaMessage, jidNormalizedUser } from '@whiskeysockets/baileys';
 import { getJoke, getFact } from './joke_fact';
-import { getGptResponse, downloadQuotedMedia } from './ai';
+import { getGptResponse, downloadQuotedMedia, generateImageBuffer } from './ai';
 
 const serverStartTime = Date.now();
 
@@ -981,30 +981,92 @@ export const commands: Command[] = [
     description: 'Displays this beautiful command menu',
     usage: '.menu',
     handler: async (ctx) => {
-      const { sock, msg, chatJid } = ctx;
+      const { sock, msg, chatJid, userId } = ctx;
       
-      // Group commands by category
-      const categories: { [key: string]: Command[] } = {};
+      const { dateStr, timeStr } = getFormattedDateTime();
+      const uptimeStr = formatUptime(Date.now() - serverStartTime);
+      const ramStr = getRamUsage();
+      const totalCmds = commands.length;
+      const currentMode = getBotMode(userId).toUpperCase();
+      const nodeVersion = process.version;
+      const platformStr = process.platform.charAt(0).toUpperCase() + process.platform.slice(1);
+
+      const headerBox = `╔════════════════════════════╗
+┃ 🤖 ${toBoldSans('HIJJAZE BOT DASHBOARD')}
+╠════════════════════════════╣
+┃ 👑 Creator : Kashfurrahman Kashaf Hijjaze
+┃ 📺 YouTube : Kashfurrahman Kashaf Hijjaze
+┃ ⚡ Version : v7.2.1-MD
+┃ ⏱ Runtime : ${uptimeStr}
+┃ 📅 Date    : ${dateStr}
+┃ 🕒 Time    : ${timeStr}
+┃ 🌍 Mode    : ${currentMode}
+┃ 🟢 Status  : Online
+┃ 📌 Prefix  : .
+┃ 💾 RAM     : ${ramStr}
+┃ 🖥 Platform : ${platformStr}
+┃ 📦 Node.js  : ${nodeVersion}
+┃ 📊 Commands : ${totalCmds}
+╚════════════════════════════╝`;
+
+      // Group commands by category using mapped names
+      const grouped: { [key: string]: Command[] } = {
+        '🤖 AI COMMANDS': [],
+        '🎮 FUN COMMANDS': [],
+        '📖 ISLAMIC COMMANDS': [],
+        '👥 GROUP COMMANDS': [],
+        '👑 ADMIN COMMANDS': [],
+        '🛠 UTILITY COMMANDS': [],
+        '⚙ SYSTEM COMMANDS': [],
+        '🎵 MEDIA COMMANDS': [],
+        '⬇ DOWNLOAD COMMANDS': [],
+        '🔍 SEARCH COMMANDS': [],
+        '🎨 IMAGE COMMANDS': [],
+        '🧰 OWNER COMMANDS': []
+      };
+
       commands.forEach(cmd => {
-        if (!categories[cmd.category]) {
-          categories[cmd.category] = [];
+        const cat = getDisplayCategory(cmd);
+        if (!grouped[cat]) {
+          grouped[cat] = [];
         }
-        categories[cmd.category].push(cmd);
+        grouped[cat].push(cmd);
       });
 
-      let menuText = `🌟 *HIJJAZE BOT - COMMAND MENU* 🌟\n━━━━━━━━━━━━━━━━━━━\n\n`;
+      let menuText = `${headerBox}\n\n`;
 
-      for (const cat of Object.keys(categories)) {
-        menuText += `${cat} COMMANDS\n`;
-        categories[cat].forEach(cmd => {
-          menuText += `  • *.${cmd.name}*\n`;
-          menuText += `    _${cmd.description}_\n`;
-          menuText += `    _Usage: ${cmd.usage}_\n`;
+      for (const [catName, list] of Object.entries(grouped)) {
+        if (list.length === 0) continue;
+        
+        menuText += `╔════════════════════════════╗\n`;
+        menuText += `┃ ${toBoldSans(catName)}\n`;
+        menuText += `╠════════════════════════════╣\n`;
+        
+        list.forEach(cmd => {
+          const aliasesStr = cmd.aliases && cmd.aliases.length > 0 ? ` [${cmd.aliases.join(', ')}]` : '';
+          menuText += `┃ • *.${cmd.name}*${aliasesStr}\n`;
+          menuText += `┃   _${cmd.description}_\n`;
+          menuText += `┃   _Usage: ${cmd.usage}_\n`;
+          menuText += `┃\n`;
         });
-        menuText += `\n`;
+        
+        // Trim trailing empty separator lines
+        menuText = menuText.slice(0, -2) + '\n';
+        menuText += `╚════════════════════════════╝\n\n`;
       }
 
-      menuText += `━━━━━━━━━━━━━━━━━━━\n💡 _Tip: Use commands starting with a dot (.) prefix._`;
+      const footerBox = `╔════════════════════════════╗
+┃ ❤️ Thank you for using
+┃ 🤖 ${toBoldSans('HIJJAZE BOT')}
+┃
+┃ 👑 Developed by
+┃ Kashfurrahman Kashaf Hijjaze
+┃
+┃ 🚀 Fast • Secure • Powerful
+┃ 🔥 Made with Baileys MD
+╚════════════════════════════╝`;
+
+      menuText += footerBox;
 
       await sock.sendMessage(chatJid, { text: menuText }, { quoted: msg });
     }
@@ -1312,6 +1374,166 @@ ${aiResponse}
         }
       }
     }
+  },
+  {
+    name: 'imagine',
+    aliases: ['image', 'img', 'draw', 'gen'],
+    category: '🎨 IMAGE',
+    description: 'Generates ultra-HD realistic AI images from any prompt or emoji',
+    usage: '.imagine [description/emoji] or reply to a message with .imagine',
+    handler: async (ctx) => {
+      const { sock, msg, chatJid, args } = ctx;
+
+      // Extract prompt text from args or replied/quoted message
+      let promptText = args.join(' ').trim();
+
+      const contextInfo = msg.message?.extendedTextMessage?.contextInfo || 
+                          msg.message?.imageMessage?.contextInfo || 
+                          msg.message?.videoMessage?.contextInfo || 
+                          msg.message?.documentMessage?.contextInfo;
+
+      if (contextInfo?.quotedMessage) {
+        const unwrappedQuoted = unwrapMessage(contextInfo.quotedMessage);
+        if (unwrappedQuoted) {
+          const quotedText = unwrappedQuoted.conversation ||
+                             unwrappedQuoted.extendedTextMessage?.text ||
+                             unwrappedQuoted.imageMessage?.caption ||
+                             unwrappedQuoted.videoMessage?.caption ||
+                             unwrappedQuoted.documentMessage?.caption || '';
+          if (quotedText && !promptText) {
+            promptText = quotedText.trim();
+          }
+        }
+      }
+
+      // If no prompt text provided
+      if (!promptText) {
+        await sock.sendMessage(chatJid, { text: '❌ Please describe the image you want to generate.' }, { quoted: msg });
+        return;
+      }
+
+      // Send premium loading message
+      const loadingText = `━━━━━━━━━━━━━━━━━━━━━━━
+🎨 *𝗛𝗜𝗝𝗝𝗔𝗭𝗘 • 𝗜𝗠𝗔𝗚𝗜𝗡𝗘*
+━━━━━━━━━━━━━━━━━━━━━━━
+
+🖌 *Creating your masterpiece...*
+
+⏳ Please wait while the AI transforms your idea into a beautiful image.
+
+━━━━━━━━━━━━━━━━━━━━━━━`;
+
+      let loadingMsg: any = null;
+      try {
+        loadingMsg = await sock.sendMessage(chatJid, { text: loadingText }, { quoted: msg });
+      } catch (err) {
+        console.error('[Imagine] Error sending loading message:', err);
+      }
+
+      // Presence update
+      try {
+        await sock.sendPresenceUpdate('composing', chatJid);
+      } catch (err) {
+        // Ignored
+      }
+
+      try {
+        const { buffer } = await generateImageBuffer(promptText);
+
+        const captionText = `━━━━━━━━━━━━━━━━━━━━━━━
+🎨 *𝗛𝗜𝗝𝗝𝗔𝗭𝗘 • 𝗜𝗠𝗔𝗚𝗜𝗡𝗘*
+━━━━━━━━━━━━━━━━━━━━━━━
+
+📝 *Prompt:* ${promptText}
+
+✨ *Generated by Hijjaze Bot AI*
+━━━━━━━━━━━━━━━━━━━━━━━`;
+
+        await sock.sendMessage(chatJid, {
+          image: buffer,
+          caption: captionText
+        }, { quoted: msg });
+
+        // Delete loading message after image is sent
+        if (loadingMsg?.key) {
+          try {
+            await sock.sendMessage(chatJid, { delete: loadingMsg.key });
+          } catch (e) {
+            // Ignore
+          }
+        }
+      } catch (err: any) {
+        console.error('[Imagine] Error generating image:', err);
+        const errMessage = err?.message || '';
+
+        if (loadingMsg?.key) {
+          try {
+            await sock.sendMessage(chatJid, { delete: loadingMsg.key });
+          } catch (e) {}
+        }
+
+        if (errMessage.includes('unavailable') || errMessage.includes('API Key')) {
+          await sock.sendMessage(chatJid, { text: '❌ The image generation service is temporarily unavailable.' }, { quoted: msg });
+        } else {
+          await sock.sendMessage(chatJid, { text: '❌ Unable to generate your image at the moment. Please try again later.' }, { quoted: msg });
+        }
+      } finally {
+        try {
+          await sock.sendPresenceUpdate('paused', chatJid);
+        } catch (err) {
+          // Ignored
+        }
+      }
+    }
+  },
+  {
+    name: 'channel',
+    aliases: ['setchannel', 'ch'],
+    category: '⚙️ SYSTEM',
+    description: 'View or update the official WhatsApp Channel configuration',
+    usage: '.channel or .channel [name|link|jid] [value]',
+    handler: async (ctx) => {
+      const { sock, msg, chatJid, args } = ctx;
+      const ownerJid = cleanJid(sock.user?.id || '');
+      const isOwner = msg.key.fromMe || ctx.senderJid === ownerJid;
+
+      let config = getChannelConfig();
+
+      if (args.length >= 2 && isOwner) {
+        const field = args[0].toLowerCase();
+        const value = args.slice(1).join(' ').trim();
+
+        if (field === 'name') {
+          config = setChannelConfig({ name: value });
+          await sock.sendMessage(chatJid, { text: `✅ Updated Channel Name to: *${config.name}*` }, { quoted: msg });
+          return;
+        } else if (field === 'link' || field === 'url') {
+          config = setChannelConfig({ link: value });
+          await sock.sendMessage(chatJid, { text: `✅ Updated Channel Link to: *${config.link}*` }, { quoted: msg });
+          return;
+        } else if (field === 'jid' || field === 'newsletter') {
+          config = setChannelConfig({ newsletterJid: value.includes('@newsletter') ? value : `${value}@newsletter` });
+          await sock.sendMessage(chatJid, { text: `✅ Updated Newsletter JID to: *${config.newsletterJid}*` }, { quoted: msg });
+          return;
+        }
+      }
+
+      const infoText = `━━━━━━━━━━━━━━━━━━━━━━━
+📢 *𝗪𝗛𝗔𝗧𝗦𝗔𝗣𝗣 𝗖𝗛𝗔𝗡𝗡𝗘𝗟 𝗖𝗢𝗡𝗙𝗜𝗚*
+━━━━━━━━━━━━━━━━━━━━━━━
+
+📌 *Channel Name:* ${config.name}
+🔗 *Channel Link:* ${config.link}
+🆔 *Newsletter JID:* ${config.newsletterJid}
+
+━━━━━━━━━━━━━━━━━━━━━━━
+💡 *Owner Commands:*
+• \`.channel name [New Name]\`
+• \`.channel link [https://whatsapp.com/channel/...]\`
+• \`.channel jid [120363426834632590@newsletter]\``;
+
+      await sock.sendMessage(chatJid, { text: infoText }, { quoted: msg });
+    }
   }
 ];
 
@@ -1342,6 +1564,168 @@ function splitMessage(text: string, maxLength: number = 4000): string[] {
   return chunks;
 }
 
+// Helper to convert standard text into bold sans-serif Unicode
+export function toBoldSans(text: string): string {
+  let result = '';
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code >= 65 && code <= 90) {
+      result += String.fromCodePoint(code - 65 + 120276);
+    } else if (code >= 97 && code <= 122) {
+      result += String.fromCodePoint(code - 97 + 120302);
+    } else if (code >= 48 && code <= 57) {
+      result += String.fromCodePoint(code - 48 + 120812);
+    } else {
+      result += text[i];
+    }
+  }
+  return result;
+}
+
+// Format memory/RAM usage
+export function getRamUsage(): string {
+  try {
+    const mem = process.memoryUsage();
+    return `${(mem.rss / 1024 / 1024).toFixed(1)} MB`;
+  } catch (err) {
+    return 'Unknown MB';
+  }
+}
+
+// Get beautifully formatted date and time in IST (Asia/Kolkata)
+export function getFormattedDateTime() {
+  try {
+    const dateObj = new Date();
+    const dateStr = dateObj.toLocaleDateString('en-US', {
+      weekday: 'long',
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+      timeZone: 'Asia/Kolkata'
+    });
+    const timeStr = dateObj.toLocaleTimeString('en-US', {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true,
+      timeZone: 'Asia/Kolkata'
+    });
+    return { dateStr, timeStr };
+  } catch (e) {
+    try {
+      const dateObj = new Date();
+      const dateStr = dateObj.toLocaleDateString('en-US', {
+        weekday: 'long',
+        year: 'numeric',
+        month: 'long',
+        day: 'numeric'
+      });
+      const timeStr = dateObj.toLocaleTimeString('en-US', {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: true
+      });
+      return { dateStr, timeStr };
+    } catch (err) {
+      const d = new Date();
+      return { dateStr: d.toDateString(), timeStr: d.toTimeString().split(' ')[0] };
+    }
+  }
+}
+
+// Map registered command categories to beautiful category display names
+export function getDisplayCategory(cmd: Command): string {
+  if (cmd.ownerOnly) {
+    return '🧰 OWNER COMMANDS';
+  }
+  const cat = cmd.category.toUpperCase().replace(/[^A-Z\s]/g, '').trim();
+  if (cat.includes('SYSTEM')) return '⚙ SYSTEM COMMANDS';
+  if (cat.includes('UTILITY')) return '🛠 UTILITY COMMANDS';
+  if (cat.includes('FUN')) return '🎮 FUN COMMANDS';
+  if (cat.includes('ISLAMIC')) return '📖 ISLAMIC COMMANDS';
+  if (cat.includes('GROUP')) return '👥 GROUP COMMANDS';
+  if (cat.includes('ADMIN')) return '👑 ADMIN COMMANDS';
+  if (cat.includes('MEDIA')) return '🎵 MEDIA COMMANDS';
+  if (cat.includes('DOWNLOAD')) return '⬇ DOWNLOAD COMMANDS';
+  if (cat.includes('SEARCH') || cat.includes('INFORMATION')) return '🔍 SEARCH COMMANDS';
+  if (cat.includes('IMAGE')) return '🎨 IMAGE COMMANDS';
+  if (cat.includes('AI')) return '🤖 AI COMMANDS';
+  return `✨ ${cmd.category.toUpperCase()} COMMANDS`;
+}
+
+// Detect theme type based on text content and active command
+export function detectThemeType(text: string, cmd?: Command): string {
+  const cleanText = text.trim();
+  
+  if (cleanText.startsWith('❌') || cleanText.includes('Error:') || cleanText.toLowerCase().includes('failed')) {
+    return 'error';
+  }
+  if (cleanText.startsWith('✅') || cleanText.toLowerCase().includes('success')) {
+    return 'success';
+  }
+  if (cleanText.startsWith('⚠️') || cleanText.toLowerCase().includes('warning')) {
+    return 'warning';
+  }
+  if (cleanText.startsWith('ℹ️') || cleanText.startsWith('🔔')) {
+    return 'info';
+  }
+  
+  if (cmd) {
+    if (cmd.ownerOnly) return 'owner';
+    const cat = cmd.category.toUpperCase().replace(/[^A-Z\s]/g, '').trim();
+    if (cat.includes('AI')) return 'ai';
+    if (cat.includes('FUN')) return 'fun';
+    if (cat.includes('SYSTEM')) return 'system';
+    if (cat.includes('UTILITY')) return 'utility';
+    if (cat.includes('INFORMATION') || cat.includes('SEARCH')) return 'info';
+    if (cat.includes('ADMIN')) return 'admin';
+    if (cat.includes('GROUP')) return 'group';
+    if (cat.includes('DOWNLOAD')) return 'download';
+    if (cat.includes('IMAGE')) return 'image';
+    if (cat.includes('MEDIA')) return 'media';
+  }
+  
+  return 'info';
+}
+
+// Wrap plain text in a beautifully designed Unicode box according to theme
+export function wrapInPremiumBox(text: string, theme: string): string {
+  let title = '🔵 𝗜𝗡𝗙𝗢𝗥𝗠𝗔𝗧𝗜𝗢𝗡';
+  switch (theme) {
+    case 'success': title = '🟢 𝗦𝗨𝗖𝗖𝗘𝗦𝗦'; break;
+    case 'error': title = '🔴 𝗘𝗥𝗥𝗢𝗥'; break;
+    case 'warning': title = '🟡 𝗪𝗔𝗥𝗡𝗜𝗡𝗚'; break;
+    case 'ai': title = '🟣 𝗛𝗜𝗝𝗝𝗔𝗭𝗘 𝗔𝗜'; break;
+    case 'fun': title = '🤣 𝗛𝗜𝗝𝗝𝗔𝗭𝗘 𝗙𝗨𝗡'; break;
+    case 'system': title = '⚙️ 𝗦𝗬𝗦𝗧𝗘𝗠 𝗦𝗧𝗔𝗧𝗨𝗦'; break;
+    case 'utility': title = '🛠️ 𝗨𝗧𝗜𝗟𝗜𝗧𝗬'; break;
+    case 'owner': title = '👑 𝗢𝗪𝗡𝗘𝗥 𝗖𝗢𝗡𝗧𝗥𝗢𝗟'; break;
+    case 'admin': title = '👑 𝗔𝗗𝗠𝗜𝗡 𝗣𝗔𝗡𝗘𝗟'; break;
+    case 'group': title = '👥 𝗚𝗥𝗢𝗨𝗣 𝗔𝗖𝗧𝗜𝗢𝗡'; break;
+    case 'download': title = '⬇️ 𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗𝗘𝗥'; break;
+    case 'image': title = '🎨 𝗜𝗠𝗔𝗚𝗘 𝗟𝗔𝗕'; break;
+    case 'media': title = '🎵 𝗠𝗘𝗗𝗜𝗔 𝗛𝗨𝗕'; break;
+  }
+
+  const lines = text.split('\n').map(line => line.trim()).filter(line => line.length > 0);
+  
+  let formatted = `╔════════════════════════════╗\n`;
+  formatted += `┃ ${title}\n`;
+  formatted += `╠════════════════════════════╣\n`;
+  
+  lines.forEach(line => {
+    if (line.startsWith('•') || line.startsWith('-') || line.match(/^[\u2600-\u27BF]/) || line.match(/^[\uD83C-\uDBFF\uDC00-\uDFFF]/)) {
+      formatted += `┃ ${line}\n`;
+    } else {
+      formatted += `┃ • ${line}\n`;
+    }
+  });
+  
+  formatted += `╚════════════════════════════╝`;
+  return formatted;
+}
+
 export async function handleIncomingMessage(sock: any, msg: any, userId: string, email: string) {
   if (!msg.message) return;
 
@@ -1350,6 +1734,76 @@ export async function handleIncomingMessage(sock: any, msg: any, userId: string,
 
   const unwrapped = unwrapMessage(msg.message);
   if (!unwrapped) return;
+
+  let activeCommand: Command | undefined = undefined;
+
+  // Wrapped sock proxy to intercept and beautifully format responses and attach the newsletter/channel button
+  const wrappedSock = new Proxy(sock, {
+    get(target, prop, receiver) {
+      if (prop === 'sendMessage') {
+        return async (jid: string, content: any, options: any = {}) => {
+          try {
+            if (content && typeof content === 'object') {
+              const channelConfig = getChannelConfig();
+
+              const forwardedNewsletterMessageInfo = {
+                newsletterJid: channelConfig.newsletterJid || '120363426834632590@newsletter',
+                serverMessageId: 1,
+                newsletterName: channelConfig.name || 'HIJJAZE BOT OFFICIAL CHANNEL'
+              };
+
+              const externalAdReply = {
+                title: channelConfig.name || 'HIJJAZE BOT OFFICIAL CHANNEL',
+                body: '📢 Tap to open WhatsApp Channel',
+                mediaType: 1,
+                previewType: 'PHOTO',
+                sourceUrl: channelConfig.link || 'https://whatsapp.com/channel/0029Vb31A1fEquiT4S34jG1d',
+                renderLargerThumbnail: true,
+                showAdAttribution: true
+              };
+
+              const existingContext = content.contextInfo || {};
+              const contextInfo = {
+                ...existingContext,
+                forwardingScore: 999,
+                isForwarded: true,
+                forwardedNewsletterMessageInfo,
+                externalAdReply
+              };
+
+              if (content.text && !content.edit) {
+                let responseText = content.text;
+                const themeType = detectThemeType(responseText, activeCommand);
+                const isFormatted = responseText.includes('╔') || responseText.includes('╚') || responseText.includes('━━━') || responseText.includes('════');
+                if (!isFormatted) {
+                  responseText = wrapInPremiumBox(responseText, themeType);
+                }
+
+                content = {
+                  ...content,
+                  text: responseText,
+                  contextInfo
+                };
+              } else {
+                content = {
+                  ...content,
+                  contextInfo
+                };
+              }
+            }
+          } catch (err) {
+            console.error('[Proxy sendMessage] Error formatting response with channel preview:', err);
+          }
+          return target.sendMessage(jid, content, options);
+        };
+      }
+      const val = Reflect.get(target, prop, receiver);
+      if (typeof val === 'function') {
+        return val.bind(target);
+      }
+      return val;
+    }
+  });
 
   // Intercept revoke / delete events
   const isProtocol = !!unwrapped.protocolMessage;
@@ -1444,6 +1898,7 @@ export async function handleIncomingMessage(sock: any, msg: any, userId: string,
   // Find command
   const command = commands.find(c => c.name === cmdName || (c.aliases && c.aliases.includes(cmdName)));
   if (!command) return;
+  activeCommand = command;
 
   const ownerJid = cleanJid(sock.user?.id || '');
   const senderJid = getSenderJid(msg, ownerJid);
@@ -1467,7 +1922,7 @@ export async function handleIncomingMessage(sock: any, msg: any, userId: string,
   // Execute command
   try {
     const ctx: CommandContext = {
-      sock,
+      sock: wrappedSock,
       msg,
       chatJid,
       senderJid,
@@ -1478,7 +1933,7 @@ export async function handleIncomingMessage(sock: any, msg: any, userId: string,
     await command.handler(ctx);
   } catch (err: any) {
     console.error(`Error executing command .${cmdName}:`, err);
-    await sock.sendMessage(chatJid, { 
+    await wrappedSock.sendMessage(chatJid, { 
       text: `❌ *Error:* Failed to execute command \`.${cmdName}\`.` 
     }, { quoted: msg });
   }

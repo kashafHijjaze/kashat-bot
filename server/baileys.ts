@@ -3,9 +3,9 @@ import pino from 'pino';
 import fs from 'fs';
 import path from 'path';
 import { Boom } from '@hapi/boom';
-import { getSessions, saveSessions, addLog, Session, getAntiDelete, getFirestoreDb } from './db';
+import { getSessions, saveSessions, addLog, Session, getAntiDelete, getFirestoreDb, isFirestoreQuotaExhausted, handleFirestoreError } from './db';
 import { handleIncomingMessage, handleDeletedMessage, unwrapMessage } from './commands';
-import { collection, doc, getDocs, setDoc, deleteDoc, query, where } from 'firebase/firestore';
+import { collection, doc, getDocs, setDoc, deleteDoc, query, where, getDoc } from 'firebase/firestore';
 
 // Robust resolver for Baileys module to support both ESM and bundled CommonJS environments
 const makeWASocket = (() => {
@@ -21,6 +21,7 @@ const DisconnectReason = BaileysModule.DisconnectReason || (BaileysModule.defaul
 const fetchLatestBaileysVersion = BaileysModule.fetchLatestBaileysVersion || (BaileysModule.default as any)?.fetchLatestBaileysVersion;
 const delay = BaileysModule.delay || (BaileysModule.default as any)?.delay;
 const jidNormalizedUser = BaileysModule.jidNormalizedUser || (BaileysModule.default as any)?.jidNormalizedUser;
+const Browsers = BaileysModule.Browsers || (BaileysModule.default as any)?.Browsers;
 
 const SESSIONS_DIR = path.join(process.cwd(), 'data', 'baileys_sessions');
 
@@ -59,7 +60,7 @@ class SessionSyncQueue {
 
     const now = Date.now();
     const timeSinceLastSync = now - this.lastSyncTime;
-    const minInterval = 2000; // Minimum 2 seconds between full syncs to avoid Firestore write-spam
+    const minInterval = 5000; // Minimum 5 seconds between full syncs to avoid Firestore write-spam
 
     if (timeSinceLastSync >= minInterval) {
       this.execute();
@@ -103,7 +104,7 @@ class SessionSyncQueue {
 
 export async function syncSingleFileToFirestore(userId: string, filename: string): Promise<void> {
   const firestoreDb = getFirestoreDb();
-  if (!firestoreDb) return;
+  if (!firestoreDb || isFirestoreQuotaExhausted()) return;
   const sessionPath = getSessionPath(userId);
   const filePath = path.join(sessionPath, filename);
   if (!fs.existsSync(filePath)) return;
@@ -120,18 +121,13 @@ export async function syncSingleFileToFirestore(userId: string, filename: string
       return;
     }
 
-    const docId = `${userId}_${filename.replace(/\./g, '_')}`;
-    await setDoc(doc(firestoreDb, 'baileys_auth_files', docId), {
-      userId,
-      filename,
-      content,
-      updatedAt: Date.now()
-    });
-    
     userCache.set(filename, content);
-    console.log(`[SessionSync] Immediately synced critical file ${filename} to Firestore for ${userId}.`);
+    
+    // Enqueue a bundled sync to firestore which is debounced but reliable
+    triggerSessionSyncToFirestore(userId);
+    console.log(`[SessionSync] Enqueued debounced bundled sync for critical file ${filename} for ${userId}.`);
   } catch (err) {
-    console.error(`[SessionSync] Error immediately syncing ${filename} to Firestore for ${userId}:`, err);
+    console.error(`[SessionSync] Error queueing file ${filename} for sync for ${userId}:`, err);
   }
 }
 
@@ -144,18 +140,43 @@ export async function syncSessionFromFirestore(userId: string): Promise<void> {
   const sessionPath = getSessionPath(userId);
   try {
     console.log(`[SessionSync] Syncing session files FROM cloud Firestore for user ${userId}...`);
-    const q = query(collection(firestoreDb, 'baileys_auth_files'), where('userId', '==', userId));
-    const querySnapshot = await getDocs(q);
     
-    if (querySnapshot.empty) {
-      console.log(`[SessionSync] No cloud session files found in Firestore for ${userId}.`);
-      return;
-    }
-
     // Get or initialize user cache
     const userCache = lastSyncedContents.get(userId) || new Map<string, string>();
     if (!lastSyncedContents.has(userId)) {
       lastSyncedContents.set(userId, userCache);
+    }
+
+    // 1. First, try the bundled/packed format from 'baileys_sessions_v2'
+    try {
+      const docRef = doc(firestoreDb, 'baileys_sessions_v2', userId);
+      const docSnap = await getDoc(docRef);
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        if (data && data.files) {
+          let count = 0;
+          for (const [filename, content] of Object.entries(data.files)) {
+            const filePath = path.join(sessionPath, filename);
+            fs.writeFileSync(filePath, content as string, 'utf-8');
+            userCache.set(filename, content as string);
+            count++;
+          }
+          console.log(`[SessionSync] Restored ${count} session files from bundled Firestore doc for user ${userId}.`);
+          return;
+        }
+      }
+    } catch (bundleErr) {
+      handleFirestoreError(bundleErr, `syncSessionFromFirestore bundle for ${userId}`);
+    }
+
+    // 2. Fallback to individual legacy files if bundled doc is not present
+    console.log(`[SessionSync] Bundled session doc not found. Falling back to individual legacy files for ${userId}...`);
+    const q = query(collection(firestoreDb, 'baileys_auth_files'), where('userId', '==', userId));
+    const querySnapshot = await getDocs(q);
+    
+    if (querySnapshot.empty) {
+      console.log(`[SessionSync] No cloud session files found in legacy Firestore for ${userId}.`);
+      return;
     }
 
     let count = 0;
@@ -168,21 +189,21 @@ export async function syncSessionFromFirestore(userId: string): Promise<void> {
         count++;
       }
     });
-    console.log(`[SessionSync] Restored ${count} session files from Firestore for user ${userId}.`);
+    console.log(`[SessionSync] Restored ${count} individual legacy session files from Firestore for user ${userId}.`);
   } catch (err) {
-    console.error(`[SessionSync] Error downloading session files for ${userId}:`, err);
+    handleFirestoreError(err, `syncSessionFromFirestore for ${userId}`);
   }
 }
 
 export async function syncSessionToFirestore(userId: string): Promise<void> {
   const firestoreDb = getFirestoreDb();
-  if (!firestoreDb) return;
+  if (!firestoreDb || isFirestoreQuotaExhausted()) return;
   const sessionPath = getSessionPath(userId);
   try {
     if (!fs.existsSync(sessionPath)) return;
     const localFiles = fs.readdirSync(sessionPath).filter(f => f.endsWith('.json'));
     
-    console.log(`[SessionSync] Uploading up to ${localFiles.length} session files to Firestore for ${userId}...`);
+    console.log(`[SessionSync] Bundling up to ${localFiles.length} session files to Firestore for ${userId}...`);
 
     // Get or initialize user cache
     const userCache = lastSyncedContents.get(userId) || new Map<string, string>();
@@ -190,60 +211,51 @@ export async function syncSessionToFirestore(userId: string): Promise<void> {
       lastSyncedContents.set(userId, userCache);
     }
 
-    const localFileSet = new Set<string>();
+    const filesMap: { [filename: string]: string } = {};
+    let hasChanges = false;
+
     for (const filename of localFiles) {
       const filePath = path.join(sessionPath, filename);
-      if (!fs.existsSync(filePath)) {
-        console.log(`[SessionSync] File ${filename} was deleted before we could upload. Skipping.`);
-        continue;
-      }
+      if (!fs.existsSync(filePath)) continue;
       
       try {
         const content = fs.readFileSync(filePath, 'utf-8');
-        localFileSet.add(filename);
+        filesMap[filename] = content;
         
-        // Skip upload if content matches the cached version
-        if (userCache.get(filename) === content) {
-          continue;
+        if (userCache.get(filename) !== content) {
+          hasChanges = true;
+          userCache.set(filename, content);
         }
-        
-        const docId = `${userId}_${filename.replace(/\./g, '_')}`;
-        await setDoc(doc(firestoreDb, 'baileys_auth_files', docId), {
-          userId,
-          filename,
-          content,
-          updatedAt: Date.now()
-        });
-        
-        userCache.set(filename, content);
       } catch (readErr: any) {
-        if (readErr.code === 'ENOENT') {
-          console.log(`[SessionSync] File ${filename} vanished during read. Skipping.`);
-        } else {
-          console.error(`[SessionSync] Failed to sync session file ${filename}:`, readErr);
+        if (readErr.code !== 'ENOENT') {
+          console.error(`[SessionSync] Failed to read session file ${filename}:`, readErr);
         }
       }
     }
 
-    // Clean up files in Firestore that are no longer present locally
-    const q = query(collection(firestoreDb, 'baileys_auth_files'), where('userId', '==', userId));
-    const querySnapshot = await getDocs(q);
-    
-    for (const docSnap of querySnapshot.docs) {
-      const data = docSnap.data();
-      if (data && data.filename) {
-        const localFilePath = path.join(sessionPath, data.filename);
-        if (!localFileSet.has(data.filename) && !fs.existsSync(localFilePath)) {
-          console.log(`[SessionSync] Deleting obsolete cloud file ${data.filename} from Firestore for ${userId}...`);
-          await deleteDoc(docSnap.ref);
-          userCache.delete(data.filename);
-        }
+    // Check if any file in the user cache was deleted locally
+    for (const cachedFilename of Array.from(userCache.keys())) {
+      if (!filesMap[cachedFilename]) {
+        hasChanges = true;
+        userCache.delete(cachedFilename);
       }
     }
+
+    if (!hasChanges) {
+      console.log(`[SessionSync] No changes in session files detected for ${userId}. Skipping Firestore write.`);
+      return;
+    }
+
+    // Save all files bundled as a single doc
+    await setDoc(doc(firestoreDb, 'baileys_sessions_v2', userId), {
+      userId,
+      updatedAt: Date.now(),
+      files: filesMap
+    });
     
-    console.log(`[SessionSync] Cloud session files sync completed successfully for ${userId}.`);
+    console.log(`[SessionSync] Successfully synced bundled session files to Firestore for ${userId} (1 write operation).`);
   } catch (err) {
-    console.error(`[SessionSync] Error syncing session files to Firestore for ${userId}:`, err);
+    handleFirestoreError(err, `syncSessionToFirestore for ${userId}`);
   }
 }
 
@@ -378,16 +390,22 @@ export async function disconnectWhatsApp(userId: string, email: string) {
 
   // Delete session files from Firestore
   const firestoreDb = getFirestoreDb();
-  if (firestoreDb) {
+  if (firestoreDb && !isFirestoreQuotaExhausted()) {
     try {
       const q = query(collection(firestoreDb, 'baileys_auth_files'), where('userId', '==', userId));
       const querySnapshot = await getDocs(q);
       for (const docSnap of querySnapshot.docs) {
         await deleteDoc(docSnap.ref);
       }
+      
+      // Also delete bundled sessions doc
+      try {
+        await deleteDoc(doc(firestoreDb, 'baileys_sessions_v2', userId));
+      } catch (bundleDelErr) {}
+      
       console.log(`[SessionSync] Cleared Firestore session files for disconnected user: ${userId}`);
     } catch (err) {
-      console.error(`[SessionSync] Error clearing Firestore session files for ${userId}:`, err);
+      handleFirestoreError(err, `clearFirestoreSessionFiles for ${userId}`);
     }
   }
 
@@ -478,12 +496,14 @@ export async function initWhatsAppSession(
     printQRInTerminal: false,
     auth: state,
     logger: pino({ level: 'silent' }) as any,
-    browser: ['Mac OS', 'Chrome', '121.0.0.0'],
+    browser: Browsers ? Browsers.ubuntu('Chrome') : ['Ubuntu', 'Chrome', '20.0.04'],
     syncFullHistory: false,
     shouldSyncHistoryMessage: () => false,
     connectTimeoutMs: 60000,
-    defaultQueryTimeoutMs: 0,
-    keepAliveIntervalMs: 30000
+    defaultQueryTimeoutMs: 60000,
+    keepAliveIntervalMs: 25000,
+    markOnlineOnConnect: true,
+    getMessage: async () => undefined
   });
 
   activeSockets.set(userId, sock);
@@ -617,7 +637,8 @@ export async function initWhatsAppSession(
         shouldReconnect = false;
       }
 
-      console.log(`Connection closed for ${userId}, reason: ${lastDisconnect?.error || 'Unknown'}, isQrTimeout: ${isQrTimeout}, reconnecting: ${shouldReconnect}`);
+      const cleanReason = (errStr || causeStr || 'Disconnected').replace(/^Error:\s*/i, '');
+      console.log(`Connection closed for ${userId}, reason: ${cleanReason}, isQrTimeout: ${isQrTimeout}, reconnecting: ${shouldReconnect}`);
       
       if (activeSockets.get(userId) === sock) {
         activeSockets.delete(userId);
@@ -640,16 +661,22 @@ export async function initWhatsAppSession(
           });
         }
       } else {
-        // Reconnect after delay with exponential back-off
-        const attempts = reconnectAttempts.get(userId) || 0;
-        reconnectAttempts.set(userId, attempts + 1);
-        
-        const delayMs = Math.min(5000 * Math.pow(1.5, attempts), 60000);
-        console.log(`[Reconnection] Scheduling reconnect attempt ${attempts + 1} for ${userId} in ${Math.round(delayMs)}ms...`);
+        // Stream error / restart required detection
+        const isRestart = statusCode === DisconnectReason?.restartRequired || statusCode === 515 || lowerErrStr.includes('stream') || lowerErrStr.includes('restart') || lowerCauseStr.includes('stream') || lowerCauseStr.includes('restart');
+
+        let delayMs = 1000;
+        if (!isRestart) {
+          const attempts = reconnectAttempts.get(userId) || 0;
+          reconnectAttempts.set(userId, attempts + 1);
+          delayMs = Math.min(3000 * Math.pow(1.5, attempts), 30000);
+          console.log(`[Reconnection] Scheduling reconnect attempt ${attempts + 1} for ${userId} in ${Math.round(delayMs)}ms...`);
+        } else {
+          console.log(`[Reconnection] Stream restart required for ${userId}. Reconnecting immediately in 1s...`);
+        }
         
         if (ioInstance) {
-          ioInstance.to(userId).emit('wa-status', { status: 'connecting', message: `Reconnecting (Attempt ${attempts + 1})...` });
-          ioInstance.to('admin').emit('admin-session-update', { userId, status: 'connecting', message: `Reconnecting (Attempt ${attempts + 1})...`, email });
+          ioInstance.to(userId).emit('wa-status', { status: 'connecting', message: isRestart ? 'Restarting connection stream...' : 'Reconnecting...' });
+          ioInstance.to('admin').emit('admin-session-update', { userId, status: 'connecting', message: isRestart ? 'Restarting connection stream...' : 'Reconnecting...', email });
         }
         await delay(delayMs);
 
@@ -786,23 +813,47 @@ export async function initWhatsAppSession(
 
 // Generate pairing code for phone number
 export async function generatePairingCode(userId: string, email: string, phone: string): Promise<string> {
-  addLog(userId, email, 'pairing_request', `Generating WhatsApp pairing code for +${phone}`);
-  
   // Format phone number (digits only)
-  const formattedPhone = phone.replace(/\D/g, '');
-  
+  let formattedPhone = phone.replace(/\D/g, '');
+  if (formattedPhone.startsWith('00')) {
+    formattedPhone = formattedPhone.substring(2);
+  }
+
+  if (!formattedPhone || formattedPhone.length < 8) {
+    throw new Error('Please enter a valid phone number with country code (e.g., 923001234567).');
+  }
+
+  addLog(userId, email, 'pairing_request', `Generating WhatsApp pairing code for +${formattedPhone}`);
+
+  // Disconnect any existing session files/sockets to ensure clean state
+  await disconnectWhatsApp(userId, email);
+
   const sock = await initWhatsAppSession(userId, email, false, formattedPhone);
   
-  // Wait a small delay to ensure connection registration
+  // Wait a brief delay for WS connection setup
   await delay(3000);
-  
+
   try {
-    const code = await sock.requestPairingCode(formattedPhone);
-    addLog(userId, email, 'pairing_code_generated', `Pairing code successfully generated: ${code}`);
-    return code;
+    if (sock.authState?.creds?.registered) {
+      throw new Error('Device is already linked. Disconnect first to pair a new number.');
+    }
+
+    const rawCode = await sock.requestPairingCode(formattedPhone);
+    if (!rawCode) {
+      throw new Error('WhatsApp servers did not return a pairing code. Please check your phone number.');
+    }
+
+    // Format 8-digit code as XXXX-XXXX for legibility
+    const formattedCode = (rawCode.length === 8 && !rawCode.includes('-')) 
+      ? `${rawCode.slice(0, 4)}-${rawCode.slice(4)}` 
+      : rawCode;
+
+    addLog(userId, email, 'pairing_code_generated', `Pairing code successfully generated: ${formattedCode}`);
+    return formattedCode;
   } catch (err: any) {
-    addLog(userId, email, 'pairing_code_failed', `Pairing code failed: ${err.message}`);
-    throw err;
+    console.error('[Baileys] Pairing code error:', err);
+    addLog(userId, email, 'pairing_code_failed', `Pairing code failed: ${err.message || err}`);
+    throw new Error(err.message || 'Failed to request pairing code from WhatsApp. Please verify the phone number.');
   }
 }
 
