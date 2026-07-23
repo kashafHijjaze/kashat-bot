@@ -369,24 +369,33 @@ export async function getJoke(userKey: string, categoryPreference?: string): Pro
 The joke must be funny, safe for school and children, and follow the requested category.
 Return the joke strictly as a JSON object containing "setup", "punchline", and "explanation" (an educational or entertaining explanation of why the joke is funny).`;
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.5-flash',
-        contents: prompt,
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: 'OBJECT',
-            properties: {
-              setup: { type: 'STRING' },
-              punchline: { type: 'STRING' },
-              explanation: { type: 'STRING' }
-            },
-            required: ['setup', 'punchline', 'explanation']
-          }
-        }
-      });
+      const modelsToTry = ['gemini-3.6-flash', 'gemini-flash-latest'];
+      let responseText: string | undefined;
 
-      const responseText = response.text;
+      for (const modelName of modelsToTry) {
+        try {
+          const response = await ai.models.generateContent({
+            model: modelName,
+            contents: prompt,
+            config: {
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: 'OBJECT',
+                properties: {
+                  setup: { type: 'STRING' },
+                  punchline: { type: 'STRING' },
+                  explanation: { type: 'STRING' }
+                },
+                required: ['setup', 'punchline', 'explanation']
+              }
+            }
+          });
+          responseText = response.text;
+          if (responseText) break;
+        } catch (modelErr) {
+          console.warn(`[JokeFact] Joke generation failed with model ${modelName}, trying fallback...`);
+        }
+      }
       if (responseText) {
         const parsed: any = JSON.parse(responseText);
         if (parsed.setup && parsed.punchline && parsed.explanation) {
@@ -473,23 +482,32 @@ export async function getFact(userKey: string, topicPreference?: string): Promis
 The fact must be completely true, accurate, family-friendly, and amazing.
 Return the fact strictly as a JSON object containing "fact" (one engaging sentence) and "explanation" (a brief context or background explanation to make it informative and entertaining).`;
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.5-flash',
-        contents: prompt,
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: 'OBJECT',
-            properties: {
-              fact: { type: 'STRING' },
-              explanation: { type: 'STRING' }
-            },
-            required: ['fact', 'explanation']
-          }
-        }
-      });
+      const modelsToTry = ['gemini-3.6-flash', 'gemini-flash-latest'];
+      let responseText: string | undefined;
 
-      const responseText = response.text;
+      for (const modelName of modelsToTry) {
+        try {
+          const response = await ai.models.generateContent({
+            model: modelName,
+            contents: prompt,
+            config: {
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: 'OBJECT',
+                properties: {
+                  fact: { type: 'STRING' },
+                  explanation: { type: 'STRING' }
+                },
+                required: ['fact', 'explanation']
+              }
+            }
+          });
+          responseText = response.text;
+          if (responseText) break;
+        } catch (modelErr) {
+          console.warn(`[JokeFact] Fact generation failed with model ${modelName}, trying fallback...`);
+        }
+      }
       if (responseText) {
         const parsed: any = JSON.parse(responseText);
         if (parsed.fact && parsed.explanation) {

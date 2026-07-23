@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { GoogleGenAI, Part } from '@google/genai';
 import { downloadMediaMessage } from '@whiskeysockets/baileys';
+import { hasValidMediaKey } from './commands';
 
 // Session memory structure
 interface ChatSession {
@@ -120,17 +121,33 @@ You are capable of: question answering, general chatting, coding/debugging in al
 When analyzing documents, code snippets, or images, provide clear, step-by-step insights and solutions.
 Be polite, professional, and friendly. Avoid harmful, offensive, or non-family-friendly content.`;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.5-flash',
-      contents: session.history,
-      config: {
-        systemInstruction,
-        // Standard temperature for balanced creativity and accuracy
-        temperature: 0.7
-      }
-    });
+    const modelsToTry = ['gemini-3.6-flash', 'gemini-flash-latest'];
+    let lastError: any = null;
+    let answer: string | undefined;
 
-    const answer = response.text || 'I was unable to formulate a response.';
+    for (const modelName of modelsToTry) {
+      try {
+        const response = await ai.models.generateContent({
+          model: modelName,
+          contents: session.history,
+          config: {
+            systemInstruction,
+            temperature: 0.7
+          }
+        });
+        if (response.text) {
+          answer = response.text;
+          break;
+        }
+      } catch (mErr) {
+        lastError = mErr;
+        console.warn(`[GPT-AI] Model ${modelName} failed, trying fallback model...`);
+      }
+    }
+
+    if (!answer) {
+      throw lastError || new Error('I was unable to formulate a response.');
+    }
     
     // Add model answer to history
     session.history.push({
@@ -160,14 +177,8 @@ export async function downloadQuotedMedia(quotedMsg: any): Promise<{ buffer: Buf
     // Supported mime types for analyze
     const mimetype = mediaMsg.mimetype || '';
     
-    // If it has media properties or a download is possible
-    if (
-      quotedMsg.imageMessage ||
-      quotedMsg.videoMessage ||
-      quotedMsg.audioMessage ||
-      quotedMsg.documentMessage ||
-      quotedMsg.stickerMessage
-    ) {
+    // If it has valid media key, download the buffer
+    if (hasValidMediaKey(mediaMsg)) {
       const buffer = await downloadMediaMessage(
         { key: {}, message: quotedMsg },
         'buffer',
@@ -221,18 +232,25 @@ Rules:
 4. Automatically recognize or infer suitable visual styles (e.g. Photorealistic, Digital Art, Oil Painting, Anime, Islamic Art, Fantasy, Sci-Fi, 3D Render, etc.).
 5. CRITICAL: Output ONLY the final enhanced prompt text in plain English. Do NOT add quotes, markdown formatting, explanations, or prefixes.`;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.5-flash',
-      contents: [{ role: 'user', parts: [{ text: `Enhance this image prompt for AI generation: ${userPrompt}` }] }],
-      config: {
-        systemInstruction,
-        temperature: 0.7
-      }
-    });
+    const modelsToTry = ['gemini-3.6-flash', 'gemini-flash-latest'];
+    for (const modelName of modelsToTry) {
+      try {
+        const response = await ai.models.generateContent({
+          model: modelName,
+          contents: [{ role: 'user', parts: [{ text: `Enhance this image prompt for AI generation: ${userPrompt}` }] }],
+          config: {
+            systemInstruction,
+            temperature: 0.7
+          }
+        });
 
-    const enhanced = response.text?.trim();
-    if (enhanced && enhanced.length > 5) {
-      return enhanced.replace(/^["']/g, '').replace(/["']$/g, '');
+        const enhanced = response.text?.trim();
+        if (enhanced && enhanced.length > 5) {
+          return enhanced.replace(/^["']/g, '').replace(/["']$/g, '');
+        }
+      } catch (mErr) {
+        console.warn(`[AI] Image prompt enhancement failed with ${modelName}`);
+      }
     }
   } catch (err) {
     console.error('[AI] Error enhancing prompt with Gemini:', err);
@@ -259,24 +277,27 @@ export async function generateImageBuffer(userPrompt: string): Promise<{ buffer:
   // Try Gemini Imagen if API Key is set
   const ai = getGeminiClient();
   if (ai) {
-    try {
-      const response = await (ai.models as any).generateImages({
-        model: 'imagen-3.0-generate-002',
-        prompt: enhancedPrompt,
-        config: {
-          numberOfImages: 1,
-          outputMimeType: 'image/jpeg',
-          aspectRatio: '1:1',
-        }
-      });
+    const imagenModelsToTry = ['imagen-3.0-generate-002', 'imagen-3.0-fast-generate-001', 'imagen-3.0-generate-001'];
+    for (const modelName of imagenModelsToTry) {
+      try {
+        const response = await (ai.models as any).generateImages({
+          model: modelName,
+          prompt: enhancedPrompt,
+          config: {
+            numberOfImages: 1,
+            outputMimeType: 'image/jpeg',
+            aspectRatio: '1:1',
+          }
+        });
 
-      const imageBytes = response?.generatedImages?.[0]?.image?.imageBytes;
-      if (imageBytes) {
-        const buffer = Buffer.from(imageBytes, 'base64');
-        return { buffer, enhancedPrompt };
+        const imageBytes = response?.generatedImages?.[0]?.image?.imageBytes;
+        if (imageBytes) {
+          const buffer = Buffer.from(imageBytes, 'base64');
+          return { buffer, enhancedPrompt };
+        }
+      } catch (err: any) {
+        // Silently try next model or fall back to high-speed free image generator
       }
-    } catch (err: any) {
-      console.warn('[Imagine] Gemini Imagen unavailable or failed, switching to free high-speed generator:', err?.message || err);
     }
   }
 

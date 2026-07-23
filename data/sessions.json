@@ -1,0 +1,130 @@
+[
+  {
+    "userId": "usr_539p1j9qs_dev_3b66vyc",
+    "email": "guest_mnq1doy@hijjaze.local",
+    "status": "connecting",
+    "phone": "923279882435"
+  },
+  {
+    "userId": "usr_53tgvg498_dev_eexx2uw",
+    "email": "guest_adgtca3@hijjaze.local",
+    "status": "connected",
+    "phone": "923438377750",
+    "pairedAt": "2026-07-23T08:04:52.774Z",
+    "antidelete": false
+  },
+  {
+    "userId": "usr_53tgvg498_dev_ib3ldjg",
+    "email": "guest_adgtca3@hijjaze.local",
+    "status": "connecting",
+    "phone": "923428783360"
+  },
+  {
+    "email": "guest_23xy3ky@hijjaze.local",
+    "userId": "usr_dyqhtxrgr_dev_0bop2d6",
+    "status": "disconnected"
+  },
+  {
+    "status": "disconnected",
+    "userId": "usr_dyqhtxrgr_dev_fnebeez",
+    "email": "guest_23xy3ky@hijjaze.local"
+  },
+  {
+    "status": "disconnected",
+    "userId": "usr_dyqhtxrgr_dev_fu8pahq",
+    "email": "guest_23xy3ky@hijjaze.local"
+  },
+  {
+    "status": "disconnected",
+    "userId": "usr_dyqhtxrgr_dev_in3ftj2",
+    "email": "guest_23xy3ky@hijjaze.local"
+  },
+  {
+    "email": "guest_23xy3ky@hijjaze.local",
+    "status": "disconnected",
+    "userId": "usr_dyqhtxrgr_dev_lisa3xb"
+  },
+  {
+    "email": "guest_23xy3ky@hijjaze.local",
+    "userId": "usr_dyqhtxrgr_dev_mxps8m2",
+    "status": "disconnected"
+  },
+  {
+    "email": "guest_23xy3ky@hijjaze.local",
+    "userId": "usr_dyqhtxrgr_dev_sk37dpt",
+    "status": "disconnected"
+  },
+  {
+    "userId": "usr_f5bknq137_dev_2tgle3w",
+    "email": "kashafhijjazi@gmail.com",
+    "status": "connecting",
+    "phone": "923279882435"
+  },
+  {
+    "userId": "usr_f5bknq137_dev_7exp2o1",
+    "email": "kashafhijjazi@gmail.com",
+    "status": "connecting"
+  },
+  {
+    "email": "kashafhijjazi@gmail.com",
+    "status": "disconnected",
+    "userId": "usr_f5bknq137_dev_ozdgcb2"
+  },
+  {
+    "userId": "usr_f5bknq137_dev_r38b6hg",
+    "status": "disconnected",
+    "email": "kashafhijjazi@gmail.com"
+  },
+  {
+    "userId": "usr_jm2ikl7e9_dev_stb7zsf",
+    "email": "guest_4e1dlwu@hijjaze.local",
+    "status": "connecting",
+    "phone": "923438377750"
+  },
+  {
+    "userId": "usr_moxvvwi7t_dev_3gm8qzx",
+    "email": "guest_je5q1st@hijjaze.local",
+    "status": "disconnected",
+    "phone": "923400931350"
+  },
+  {
+    "userId": "usr_moxvvwi7t_dev_m79hon8",
+    "email": "guest_je5q1st@hijjaze.local",
+    "status": "connecting",
+    "phone": "923279882435"
+  },
+  {
+    "userId": "usr_moxvvwi7t_dev_mnswa0e",
+    "email": "guest_je5q1st@hijjaze.local",
+    "status": "connecting",
+    "phone": "923279882435"
+  },
+  {
+    "userId": "usr_okw99ehds_dev_ff8qde7",
+    "email": "guest_i3b1nqg@hijjaze.local",
+    "status": "connecting",
+    "phone": "923279882435"
+  },
+  {
+    "userId": "usr_okw99ehds_dev_r66n36n",
+    "email": "guest_i3b1nqg@hijjaze.local",
+    "status": "connecting",
+    "phone": "923279882435"
+  },
+  {
+    "userId": "usr_okw99ehds_dev_spr6ock",
+    "email": "guest_i3b1nqg@hijjaze.local",
+    "status": "connecting",
+    "phone": "923279882435"
+  },
+  {
+    "userId": "usr_yqsctwefc_dev_7exp2o1",
+    "status": "disconnected",
+    "email": "guest_lhe5x9a@hijjaze.local"
+  },
+  {
+    "userId": "usr_yqsctwefc_dev_rjmmpnh",
+    "status": "disconnected",
+    "email": "guest_lhe5x9a@hijjaze.local"
+  }
+]

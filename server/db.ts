@@ -472,7 +472,7 @@ const CHANNEL_CONFIG_FILE = path.join(DATA_DIR, 'channel_config.json');
 
 const DEFAULT_CHANNEL_CONFIG: ChannelConfig = {
   name: 'HIJJAZE BOT OFFICIAL CHANNEL',
-  link: 'https://whatsapp.com/channel/0029Vb31A1fEquiT4S34jG1d',
+  link: 'https://whatsapp.com/channel/0029Vb7wo6O5a23w6LJo2K1y',
   newsletterJid: '120363426834632590@newsletter'
 };
 
@@ -500,5 +500,176 @@ export function setChannelConfig(config: Partial<ChannelConfig>): ChannelConfig 
   }
   return cachedChannelConfig;
 }
+
+// ==========================================
+// GROUP MODERATION PERSISTENCE (Warnings, Mutes, Bans)
+// ==========================================
+
+export interface WarningRecord {
+  id: string;
+  chatJid: string;
+  userJid: string;
+  reason: string;
+  issuedBy: string;
+  timestamp: string;
+}
+
+export interface MuteRecord {
+  chatJid: string;
+  userJid: string;
+  mutedBy: string;
+  reason: string;
+  mutedAt: string;
+  expiresAt: number | null; // epoch ms timestamp or null for permanent
+}
+
+export interface BanRecord {
+  chatJid: string;
+  userJid: string;
+  bannedBy: string;
+  reason: string;
+  bannedAt: string;
+}
+
+export interface ModerationData {
+  warnings: WarningRecord[];
+  mutes: MuteRecord[];
+  bans: BanRecord[];
+}
+
+const MODERATION_FILE = path.join(DATA_DIR, 'moderation.json');
+
+let cachedModeration: ModerationData = {
+  warnings: [],
+  mutes: [],
+  bans: []
+};
+
+try {
+  if (fs.existsSync(MODERATION_FILE)) {
+    const raw = fs.readFileSync(MODERATION_FILE, 'utf-8');
+    cachedModeration = JSON.parse(raw);
+    if (!cachedModeration.warnings) cachedModeration.warnings = [];
+    if (!cachedModeration.mutes) cachedModeration.mutes = [];
+    if (!cachedModeration.bans) cachedModeration.bans = [];
+  }
+} catch (e) {
+  cachedModeration = { warnings: [], mutes: [], bans: [] };
+}
+
+function saveModeration() {
+  try {
+    fs.writeFileSync(MODERATION_FILE, JSON.stringify(cachedModeration, null, 2));
+  } catch (e) {
+    console.error('Error saving moderation data:', e);
+  }
+}
+
+// --- WARNINGS ---
+export function addWarning(chatJid: string, userJid: string, reason: string, issuedBy: string): WarningRecord[] {
+  const newWarn: WarningRecord = {
+    id: `warn_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
+    chatJid,
+    userJid,
+    reason,
+    issuedBy,
+    timestamp: new Date().toISOString()
+  };
+  cachedModeration.warnings.push(newWarn);
+  saveModeration();
+  return getWarnings(chatJid, userJid);
+}
+
+export function getWarnings(chatJid: string, userJid: string): WarningRecord[] {
+  return cachedModeration.warnings.filter(w => w.chatJid === chatJid && w.userJid === userJid);
+}
+
+export function clearWarnings(chatJid: string, userJid: string): number {
+  const initialCount = cachedModeration.warnings.length;
+  cachedModeration.warnings = cachedModeration.warnings.filter(w => !(w.chatJid === chatJid && w.userJid === userJid));
+  const removedCount = initialCount - cachedModeration.warnings.length;
+  saveModeration();
+  return removedCount;
+}
+
+// --- MUTES ---
+export function muteUser(chatJid: string, userJid: string, mutedBy: string, reason: string, durationMs: number | null): MuteRecord {
+  // Remove existing mute if any
+  unmuteUser(chatJid, userJid);
+
+  const mutedAt = new Date().toISOString();
+  const expiresAt = durationMs ? Date.now() + durationMs : null;
+
+  const newMute: MuteRecord = {
+    chatJid,
+    userJid,
+    mutedBy,
+    reason,
+    mutedAt,
+    expiresAt
+  };
+
+  cachedModeration.mutes.push(newMute);
+  saveModeration();
+  return newMute;
+}
+
+export function unmuteUser(chatJid: string, userJid: string): boolean {
+  const initialLen = cachedModeration.mutes.length;
+  cachedModeration.mutes = cachedModeration.mutes.filter(m => !(m.chatJid === chatJid && m.userJid === userJid));
+  const removed = cachedModeration.mutes.length < initialLen;
+  if (removed) saveModeration();
+  return removed;
+}
+
+export function getMuteRecord(chatJid: string, userJid: string): MuteRecord | null {
+  const record = cachedModeration.mutes.find(m => m.chatJid === chatJid && m.userJid === userJid);
+  if (!record) return null;
+
+  // Check if expired
+  if (record.expiresAt && Date.now() > record.expiresAt) {
+    unmuteUser(chatJid, userJid);
+    return null;
+  }
+  return record;
+}
+
+export function isUserMuted(chatJid: string, userJid: string): boolean {
+  return getMuteRecord(chatJid, userJid) !== null;
+}
+
+// --- BANS ---
+export function banUser(chatJid: string, userJid: string, bannedBy: string, reason: string): BanRecord {
+  unbanUser(chatJid, userJid);
+
+  const newBan: BanRecord = {
+    chatJid,
+    userJid,
+    bannedBy,
+    reason,
+    bannedAt: new Date().toISOString()
+  };
+
+  cachedModeration.bans.push(newBan);
+  saveModeration();
+  return newBan;
+}
+
+export function unbanUser(chatJid: string, userJid: string): boolean {
+  const initialLen = cachedModeration.bans.length;
+  cachedModeration.bans = cachedModeration.bans.filter(b => !(b.chatJid === chatJid && b.userJid === userJid));
+  const removed = cachedModeration.bans.length < initialLen;
+  if (removed) saveModeration();
+  return removed;
+}
+
+export function getBanRecord(chatJid: string, userJid: string): BanRecord | null {
+  return cachedModeration.bans.find(b => b.chatJid === chatJid && b.userJid === userJid) || null;
+}
+
+export function isUserBanned(chatJid: string, userJid: string): boolean {
+  return getBanRecord(chatJid, userJid) !== null;
+}
+
 
 

@@ -3,8 +3,8 @@ import pino from 'pino';
 import fs from 'fs';
 import path from 'path';
 import { Boom } from '@hapi/boom';
-import { getSessions, saveSessions, addLog, Session, getAntiDelete, getFirestoreDb, isFirestoreQuotaExhausted, handleFirestoreError } from './db';
-import { handleIncomingMessage, handleDeletedMessage, unwrapMessage } from './commands';
+import { getSessions, saveSessions, addLog, Session, getAntiDelete, getFirestoreDb, isFirestoreQuotaExhausted, handleFirestoreError, isUserBanned } from './db';
+import { handleIncomingMessage, handleDeletedMessage, unwrapMessage, getGroupPermissions, cleanJid } from './commands';
 import { collection, doc, getDocs, setDoc, deleteDoc, query, where, getDoc } from 'firebase/firestore';
 
 // Robust resolver for Baileys module to support both ESM and bundled CommonJS environments
@@ -201,6 +201,17 @@ export async function syncSessionToFirestore(userId: string): Promise<void> {
   const sessionPath = getSessionPath(userId);
   try {
     if (!fs.existsSync(sessionPath)) return;
+    const credsPath = path.join(sessionPath, 'creds.json');
+    if (!fs.existsSync(credsPath)) {
+      console.log(`[SessionSync] creds.json does not exist locally for ${userId}. Skipping Firestore sync to protect cloud backup.`);
+      return;
+    }
+    const credsContent = fs.readFileSync(credsPath, 'utf-8');
+    if (!credsContent || credsContent.trim().length < 20) {
+      console.log(`[SessionSync] creds.json is empty or corrupted locally for ${userId}. Skipping Firestore sync to protect cloud backup.`);
+      return;
+    }
+
     const localFiles = fs.readdirSync(sessionPath).filter(f => f.endsWith('.json'));
     
     console.log(`[SessionSync] Bundling up to ${localFiles.length} session files to Firestore for ${userId}...`);
@@ -257,6 +268,41 @@ export async function syncSessionToFirestore(userId: string): Promise<void> {
   } catch (err) {
     handleFirestoreError(err, `syncSessionToFirestore for ${userId}`);
   }
+}
+
+// Check if a valid session credentials file exists locally or in cloud storage
+export async function hasSavedSession(userId: string): Promise<boolean> {
+  // 1. Check local filesystem
+  const sessionPath = path.join(SESSIONS_DIR, `session_${userId}`);
+  const credsPath = path.join(sessionPath, 'creds.json');
+  if (fs.existsSync(credsPath)) {
+    try {
+      const stats = fs.statSync(credsPath);
+      if (stats.size > 20) return true;
+    } catch (e) {}
+  }
+
+  // 2. Check Firestore
+  const firestoreDb = getFirestoreDb();
+  if (firestoreDb && !isFirestoreQuotaExhausted()) {
+    try {
+      const docRef = doc(firestoreDb, 'baileys_sessions_v2', userId);
+      const docSnap = await getDoc(docRef);
+      if (docSnap.exists() && docSnap.data()?.files?.['creds.json']) {
+        return true;
+      }
+    } catch (e) {}
+
+    try {
+      const q = query(collection(firestoreDb, 'baileys_auth_files'), where('userId', '==', userId));
+      const querySnapshot = await getDocs(q);
+      if (!querySnapshot.empty) {
+        return true;
+      }
+    } catch (e) {}
+  }
+
+  return false;
 }
 
 export function triggerSessionSyncToFirestore(userId: string) {
@@ -570,6 +616,31 @@ export async function initWhatsAppSession(
     }
   });
 
+  sock.ev.on('group-participants.update', async (update) => {
+    const { id, participants, action } = update;
+    if (action === 'add') {
+      for (const p of participants) {
+        const pJid = cleanJid(p);
+        if (isUserBanned(id, pJid)) {
+          console.log(`[Ban Enforcement] Banned user ${pJid} joined or was added to group ${id}. Enforcing ban...`);
+          try {
+            const ownerJid = cleanJid(sock.user?.id || '');
+            const perm = await getGroupPermissions(sock, id, ownerJid, true);
+            if (perm.isBotAdmin) {
+              await sock.groupParticipantsUpdate(id, [pJid], 'remove');
+              await sock.sendMessage(id, {
+                text: `🚨 *AUTOMATIC BAN ENFORCEMENT*\n\nUser @${pJid.split('@')[0]} is banned from this group and was automatically removed.`,
+                mentions: [pJid]
+              });
+            }
+          } catch (err) {
+            console.error('[Ban Enforcement Event Error]', err);
+          }
+        }
+      }
+    }
+  });
+
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
@@ -605,89 +676,62 @@ export async function initWhatsAppSession(
       }
       
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
-      let shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      
-      // If the error message or cause indicates a connection failure, network timeout, or socket issue, we MUST reconnect
-      const lowerErrStr = errStr.toLowerCase();
-      const lowerCauseStr = causeStr.toLowerCase();
-      if (
-        lowerErrStr.includes('connection') ||
-        lowerErrStr.includes('failure') ||
-        lowerErrStr.includes('timeout') ||
-        lowerErrStr.includes('stream') ||
-        lowerErrStr.includes('network') ||
-        lowerErrStr.includes('unreachable') ||
-        lowerErrStr.includes('eai_again') ||
-        lowerErrStr.includes('enotfound') ||
-        lowerErrStr.includes('econnreset') ||
-        lowerCauseStr.includes('connection') ||
-        lowerCauseStr.includes('failure') ||
-        lowerCauseStr.includes('timeout') ||
-        lowerCauseStr.includes('stream') ||
-        lowerCauseStr.includes('network') ||
-        lowerCauseStr.includes('unreachable') ||
-        lowerCauseStr.includes('eai_again') ||
-        lowerCauseStr.includes('enotfound') ||
-        lowerCauseStr.includes('econnreset')
-      ) {
-        shouldReconnect = true;
-      }
-
-      if (isQrTimeout) {
-        shouldReconnect = false;
-      }
-
-      const cleanReason = (errStr || causeStr || 'Disconnected').replace(/^Error:\s*/i, '');
-      console.log(`Connection closed for ${userId}, reason: ${cleanReason}, isQrTimeout: ${isQrTimeout}, reconnecting: ${shouldReconnect}`);
+      const cleanReason = (errStr || causeStr || `Status code ${statusCode}` || 'Disconnected').replace(/^Error:\s*/i, '');
+      console.log(`Connection closed for ${userId}, reason: ${cleanReason}, statusCode: ${statusCode}, isQrTimeout: ${isQrTimeout}`);
       
       if (activeSockets.get(userId) === sock) {
         activeSockets.delete(userId);
       }
 
-      if (!shouldReconnect) {
-        // Logged out or QR timed out
-        await disconnectWhatsApp(userId, email);
-        const logAction = isQrTimeout ? 'qr_timeout' : 'logout';
-        const logMsg = isQrTimeout ? 'WhatsApp connection pairing timed out (QR code expired).' : 'WhatsApp connection logged out.';
-        addLog(userId, email, logAction, logMsg);
+      if (isQrTimeout) {
+        console.log(`[Connection] QR pairing timed out for ${userId}. Setting status to disconnected (credentials preserved).`);
+        const currentSessions = getSessions();
+        const index = currentSessions.findIndex(s => s.userId === userId);
+        if (index !== -1 && currentSessions[index].status === 'connecting') {
+          currentSessions[index].status = 'disconnected';
+          saveSessions(currentSessions);
+        }
         if (ioInstance) {
-          ioInstance.to('admin').emit('admin-log-update', {
-            id: 'log_' + Math.random().toString(36).substr(2, 9),
-            userId,
-            email,
-            action: logAction,
-            message: logMsg,
-            timestamp: new Date().toISOString()
-          });
+          const baseUserId = userId.split('_')[0];
+          ioInstance.to(userId).emit('wa-status', { status: 'disconnected', message: 'QR pairing expired.' });
+          if (baseUserId !== userId) {
+            ioInstance.to(baseUserId).emit('wa-status', { status: 'disconnected', message: 'QR pairing expired.' });
+          }
+          ioInstance.to('admin').emit('admin-session-update', { userId, status: 'disconnected', email });
         }
-      } else {
-        // Stream error / restart required detection
-        const isRestart = statusCode === DisconnectReason?.restartRequired || statusCode === 515 || lowerErrStr.includes('stream') || lowerErrStr.includes('restart') || lowerCauseStr.includes('stream') || lowerCauseStr.includes('restart');
-
-        let delayMs = 1000;
-        if (!isRestart) {
-          const attempts = reconnectAttempts.get(userId) || 0;
-          reconnectAttempts.set(userId, attempts + 1);
-          delayMs = Math.min(3000 * Math.pow(1.5, attempts), 30000);
-          console.log(`[Reconnection] Scheduling reconnect attempt ${attempts + 1} for ${userId} in ${Math.round(delayMs)}ms...`);
-        } else {
-          console.log(`[Reconnection] Stream restart required for ${userId}. Reconnecting immediately in 1s...`);
-        }
-        
-        if (ioInstance) {
-          ioInstance.to(userId).emit('wa-status', { status: 'connecting', message: isRestart ? 'Restarting connection stream...' : 'Reconnecting...' });
-          ioInstance.to('admin').emit('admin-session-update', { userId, status: 'connecting', message: isRestart ? 'Restarting connection stream...' : 'Reconnecting...', email });
-        }
-        await delay(delayMs);
-
-        // Before executing reconnect, verify if a new socket session was established during the delay
-        if (activeSockets.has(userId) && activeSockets.get(userId) !== sock) {
-          console.log(`A newer active session exists for user ${userId} during the reconnect delay. Aborting older reconnect loop.`);
-          return;
-        }
-
-        initWhatsAppSession(userId, email, useQr);
+        addLog(userId, email, 'qr_timeout', 'WhatsApp pairing code expired.');
+        return;
       }
+
+      // CRITICAL: NEVER DELETE SESSION FILES ON CONNECTION CLOSE!
+      // Schedule automatic reconnection retry loop with exponential backoff
+      const attempts = reconnectAttempts.get(userId) || 0;
+      reconnectAttempts.set(userId, attempts + 1);
+
+      const delayMs = Math.min(3000 * Math.pow(1.3, Math.min(attempts, 10)), 30000);
+      console.log(`[Reconnection] Scheduling automatic reconnect attempt ${attempts + 1} for ${userId} in ${Math.round(delayMs)}ms...`);
+
+      if (ioInstance) {
+        const baseUserId = userId.split('_')[0];
+        const statusPayload = { status: 'connecting', message: `Reconnecting to WhatsApp (Attempt ${attempts + 1})...` };
+        ioInstance.to(userId).emit('wa-status', statusPayload);
+        if (baseUserId !== userId) {
+          ioInstance.to(baseUserId).emit('wa-status', statusPayload);
+        }
+        ioInstance.to('admin').emit('admin-session-update', { userId, status: 'connecting', message: `Reconnecting...`, email });
+      }
+
+      await delay(delayMs);
+
+      // Verify if a newer socket session was established during the delay
+      if (activeSockets.has(userId) && activeSockets.get(userId) !== sock) {
+        console.log(`A newer active session exists for user ${userId} during reconnect delay. Aborting older reconnect loop.`);
+        return;
+      }
+
+      initWhatsAppSession(userId, email, useQr).catch(reconnectErr => {
+        console.error(`[Reconnection Error] Failed to re-initialize session for ${userId}:`, reconnectErr);
+      });
     } else if (connection === 'open') {
       reconnectAttempts.delete(userId);
       let connectedPhone = '';
@@ -729,11 +773,16 @@ export async function initWhatsAppSession(
       }
 
       if (ioInstance) {
-        ioInstance.to(userId).emit('wa-status', { 
+        const baseUserId = userId.split('_')[0];
+        const payload = { 
           status: 'connected', 
           phone: connectedPhone,
           pairedAt: new Date().toISOString()
-        });
+        };
+        ioInstance.to(userId).emit('wa-status', payload);
+        if (baseUserId !== userId) {
+          ioInstance.to(baseUserId).emit('wa-status', payload);
+        }
         ioInstance.to('admin').emit('admin-session-update', { 
           userId,
           email,
@@ -910,16 +959,65 @@ export async function getWhatsAppGroups(userId: string): Promise<any[]> {
 
 // Scan and automatically reconnect any pre-existing active sessions on boot
 export async function autoConnectAllSessions() {
-  console.log('Scanning database for connected sessions to auto-restore...');
-  const sessions = getSessions();
-  const connectedSessions = sessions.filter(s => s.status === 'connected');
+  console.log('[AutoConnect] Scanning database and cloud storage for WhatsApp sessions to auto-restore...');
   
-  for (const session of connectedSessions) {
+  const firestoreDb = getFirestoreDb();
+  const allUserIds = new Set<string>();
+
+  // 1. Collect user IDs from local sessions
+  const localSessions = getSessions();
+  localSessions.forEach(s => allUserIds.add(s.userId));
+
+  // 2. Collect user IDs from local filesystem directories
+  if (fs.existsSync(SESSIONS_DIR)) {
     try {
-      console.log(`Auto-restoring session for user: ${session.email}`);
-      await initWhatsAppSession(session.userId, session.email);
+      const dirs = fs.readdirSync(SESSIONS_DIR);
+      dirs.forEach(dir => {
+        if (dir.startsWith('session_')) {
+          allUserIds.add(dir.replace('session_', ''));
+        }
+      });
+    } catch (e) {}
+  }
+
+  // 3. Collect user IDs from Firestore bundled sessions collection
+  if (firestoreDb && !isFirestoreQuotaExhausted()) {
+    try {
+      const snap = await getDocs(collection(firestoreDb, 'baileys_sessions_v2'));
+      snap.forEach(d => allUserIds.add(d.id));
+    } catch (e) {}
+  }
+
+  console.log(`[AutoConnect] Discovered ${allUserIds.size} potential session candidate(s). Checking for saved credentials...`);
+
+  for (const userId of Array.from(allUserIds)) {
+    try {
+      const hasCreds = await hasSavedSession(userId);
+      if (hasCreds) {
+        const sessionRecord = localSessions.find(s => s.userId === userId);
+        const email = sessionRecord?.email || 'user@hijjaze.bot';
+        console.log(`[AutoConnect] Auto-restoring and initializing WhatsApp session for user ID: ${userId} (${email})...`);
+        
+        // Ensure session record is marked connected in local sessions cache
+        if (sessionRecord) {
+          if (sessionRecord.status !== 'connected') {
+            sessionRecord.status = 'connected';
+            saveSessions(localSessions);
+          }
+        } else {
+          localSessions.push({
+            userId,
+            email,
+            status: 'connected'
+          });
+          saveSessions(localSessions);
+        }
+
+        // Initialize session and force restore cloud backup if local files are missing
+        await initWhatsAppSession(userId, email, false, undefined, true);
+      }
     } catch (err) {
-      console.error(`Failed to auto-restore session for user ${session.email}:`, err);
+      console.error(`[AutoConnect Error] Failed to auto-restore session for user ${userId}:`, err);
     }
   }
 }

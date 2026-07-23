@@ -51,6 +51,7 @@ import {
   getCredsJson,
   importCredsJson,
   autoConnectAllSessions,
+  hasSavedSession,
   setIoInstance
 } from './server/baileys';
 
@@ -288,11 +289,26 @@ app.post('/api/whatsapp/pair', authenticateToken, async (req: any, res) => {
 });
 
 // Check Session Connection Status
-app.get('/api/whatsapp/status', authenticateToken, (req: any, res) => {
+app.get('/api/whatsapp/status', authenticateToken, async (req: any, res) => {
   try {
     const sessions = getSessions();
     const sessionId = getSessionId(req);
-    const session = sessions.find(s => s.userId === sessionId);
+    let session = sessions.find(s => s.userId === sessionId);
+
+    // If session status is disconnected or missing, but credentials exist in local or cloud storage, restore status
+    const hasCreds = await hasSavedSession(sessionId);
+    if (hasCreds) {
+      if (!session) {
+        session = {
+          userId: sessionId,
+          email: req.user.email,
+          status: 'connected'
+        };
+      } else if (session.status === 'disconnected') {
+        session.status = 'connected';
+      }
+    }
+
     if (!session) {
       return res.json({ status: 'disconnected' });
     }
