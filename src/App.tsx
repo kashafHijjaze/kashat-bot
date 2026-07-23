@@ -4,12 +4,15 @@ import LandingPage from './components/LandingPage';
 import Dashboard from './components/Dashboard';
 import AdminPanel from './components/AdminPanel';
 import AuthModal from './components/AuthModal';
-import { Shield, ShieldAlert, LogIn, ExternalLink, Bot, Sun, Moon } from 'lucide-react';
+import AdminNotifications from './components/AdminNotifications';
+import { Shield, ShieldAlert, LogIn, LogOut, ExternalLink, Bot, Sun, Moon, User as UserIcon, Smartphone, LayoutDashboard } from 'lucide-react';
 
 export default function App() {
   const [authToken, setAuthToken] = useState<string | null>(null);
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [showAuthModal, setShowAuthModal] = useState(false);
+  const [activeView, setActiveView] = useState<'dashboard' | 'pairing' | 'admin'>('dashboard');
+  
   const [theme, setTheme] = useState<'dark' | 'light'>(() => {
     const cached = localStorage.getItem('hijjaze_theme');
     return (cached === 'light' || cached === 'dark') ? cached : 'dark';
@@ -23,7 +26,13 @@ export default function App() {
     if (storedToken && storedUser) {
       try {
         setAuthToken(storedToken);
-        setCurrentUser(JSON.parse(storedUser));
+        const parsedUser = JSON.parse(storedUser);
+        setCurrentUser(parsedUser);
+        if (parsedUser.role === 'admin') {
+          setActiveView('admin');
+        } else {
+          setActiveView('dashboard');
+        }
       } catch (e) {
         localStorage.removeItem('hijjaze_auth_token');
         localStorage.removeItem('hijjaze_auth_user');
@@ -38,6 +47,11 @@ export default function App() {
     setAuthToken(token);
     setCurrentUser(user);
     setShowAuthModal(false);
+    if (user.role === 'admin') {
+      setActiveView('admin');
+    } else {
+      setActiveView('dashboard');
+    }
   };
 
   const handleLogout = () => {
@@ -45,6 +59,7 @@ export default function App() {
     localStorage.removeItem('hijjaze_auth_user');
     setAuthToken(null);
     setCurrentUser(null);
+    setActiveView('pairing');
   };
 
   const toggleTheme = () => {
@@ -54,11 +69,10 @@ export default function App() {
   };
 
   const isAdmin = currentUser?.role === 'admin';
-  const isUser = currentUser?.role === 'user';
 
   // Theme-dependent colors for core frame
   const frameBg = theme === 'dark' ? 'bg-zinc-950 text-zinc-100' : 'bg-zinc-50 text-zinc-900';
-  const headerBg = theme === 'dark' ? 'bg-zinc-950/80 border-zinc-900/60 text-zinc-100' : 'bg-white/85 border-zinc-200 text-zinc-800';
+  const headerBg = theme === 'dark' ? 'bg-zinc-950/90 border-zinc-900/80 text-zinc-100' : 'bg-white/90 border-zinc-200 text-zinc-800';
   const mainBg = theme === 'dark' ? 'from-zinc-950 to-zinc-900/40' : 'from-white to-zinc-100/50';
   const footerBg = theme === 'dark' ? 'bg-zinc-950/80 border-zinc-900/50 text-zinc-500' : 'bg-white border-zinc-200 text-zinc-500';
 
@@ -67,15 +81,75 @@ export default function App() {
       
       {/* Top Floating Navigation Header */}
       <header className={`${headerBg} backdrop-blur-md border-b sticky top-0 z-40 transition-colors duration-200`}>
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="p-2 bg-emerald-500/10 text-emerald-400 rounded-xl border border-emerald-500/20 shadow-sm">
-              <Bot className="w-5 h-5" />
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-4">
+          
+          {/* Logo & View Navigation Switcher */}
+          <div className="flex items-center gap-6">
+            <div 
+              onClick={() => setActiveView(currentUser ? (isAdmin ? 'admin' : 'dashboard') : 'pairing')}
+              className="flex items-center gap-2.5 cursor-pointer select-none group"
+            >
+              <div className="p-2 bg-emerald-500/10 text-emerald-400 rounded-xl border border-emerald-500/20 shadow-sm group-hover:scale-105 transition-transform">
+                <Bot className="w-5 h-5" />
+              </div>
+              <span className="font-extrabold text-lg tracking-tight">Hijjaze <span className="text-emerald-500">Bot</span></span>
             </div>
-            <span className="font-extrabold text-lg tracking-tight">Hijjaze <span className="text-emerald-500">Bot</span></span>
+
+            {/* Navigation Tabs for Authenticated Users */}
+            {currentUser && (
+              <nav className="hidden md:flex items-center gap-1 p-1 bg-zinc-900/50 border border-zinc-800/80 rounded-xl">
+                {isAdmin && (
+                  <button
+                    onClick={() => setActiveView('admin')}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${
+                      activeView === 'admin'
+                        ? 'bg-red-500/20 text-red-400 border border-red-500/30'
+                        : 'text-zinc-400 hover:text-zinc-200'
+                    }`}
+                  >
+                    <Shield className="w-3.5 h-3.5" />
+                    Admin Console
+                  </button>
+                )}
+
+                <button
+                  onClick={() => setActiveView('dashboard')}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${
+                    activeView === 'dashboard'
+                      ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                      : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  <LayoutDashboard className="w-3.5 h-3.5" />
+                  My Profile & Stats
+                </button>
+
+                <button
+                  onClick={() => setActiveView('pairing')}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${
+                    activeView === 'pairing'
+                      ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                      : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  <Smartphone className="w-3.5 h-3.5" />
+                  Pairing Gateway
+                </button>
+              </nav>
+            )}
           </div>
 
-          <div className="flex items-center gap-3">
+          {/* Right Header User Controls & Logout Button */}
+          <div className="flex items-center gap-2 sm:gap-3">
+            {/* Admin Notifications Bell & Panel */}
+            {isAdmin && authToken && (
+              <AdminNotifications 
+                authToken={authToken} 
+                theme={theme} 
+                onNavigateTab={() => setActiveView('admin')}
+              />
+            )}
+
             {/* Dark / Light Theme Toggle Switch */}
             <button
               onClick={toggleTheme}
@@ -86,24 +160,39 @@ export default function App() {
               }`}
               title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}
             >
-              {theme === 'dark' ? <Sun className="w-4.5 h-4.5 animate-pulse" /> : <Moon className="w-4.5 h-4.5" />}
+              {theme === 'dark' ? <Sun className="w-4 h-4 animate-pulse" /> : <Moon className="w-4 h-4" />}
             </button>
 
             {currentUser ? (
               <div className="flex items-center gap-3">
-                <span className={`px-2 py-0.5 text-[10px] font-bold font-mono uppercase rounded border ${
-                  isAdmin 
-                    ? 'bg-red-500/10 text-red-400 border-red-500/20' 
-                    : theme === 'dark' ? 'bg-zinc-900 text-zinc-400 border-zinc-800' : 'bg-zinc-100 text-zinc-500 border-zinc-250'
-                }`}>
-                  {currentUser.role}
-                </span>
-                
-                {isAdmin && (
-                  <div className={`hidden sm:inline-block text-xs font-semibold ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-400'} font-sans`}>
-                    Master Console Enabled
+                {/* User Profile Badge */}
+                <button
+                  onClick={() => setActiveView('dashboard')}
+                  className="flex items-center gap-2.5 p-1.5 pr-3 bg-zinc-900/60 hover:bg-zinc-850 border border-zinc-800/80 hover:border-zinc-700 rounded-xl transition-all"
+                  title="View Profile Details"
+                >
+                  {currentUser.avatarUrl ? (
+                    <img src={currentUser.avatarUrl} alt="Avatar" className="w-7 h-7 rounded-lg object-cover border border-emerald-500/30" />
+                  ) : (
+                    <div className="w-7 h-7 bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 rounded-lg flex items-center justify-center font-black text-xs uppercase">
+                      {currentUser.name.charAt(0)}
+                    </div>
+                  )}
+                  <div className="text-left hidden sm:block">
+                    <span className="text-xs font-bold text-zinc-200 block leading-tight">{currentUser.name}</span>
+                    <span className="text-[10px] text-zinc-500 font-mono block leading-tight">{currentUser.email}</span>
                   </div>
-                )}
+                </button>
+
+                {/* Direct Logout Button */}
+                <button
+                  onClick={handleLogout}
+                  className="flex items-center gap-1.5 px-3 py-2 bg-zinc-900 hover:bg-red-500/10 text-zinc-400 hover:text-red-400 text-xs font-bold rounded-xl border border-zinc-800 hover:border-red-500/20 transition-all active:scale-95 shadow-sm"
+                  title="Sign Out of Application"
+                >
+                  <LogOut className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">Logout</span>
+                </button>
               </div>
             ) : (
               <button
@@ -112,7 +201,7 @@ export default function App() {
                   theme === 'dark' 
                     ? 'bg-zinc-900 hover:bg-zinc-850 border-zinc-850 hover:border-zinc-800 text-zinc-300 hover:text-zinc-100' 
                     : 'bg-zinc-150 hover:bg-zinc-200 border-zinc-250 hover:border-zinc-300 text-zinc-700 hover:text-zinc-900'
-                } text-sm font-bold rounded-xl border transition-all shadow-md`}
+                } text-xs font-bold rounded-xl border transition-all shadow-md`}
               >
                 <LogIn className="w-4 h-4" />
                 Sign In / Sign Up
@@ -120,19 +209,54 @@ export default function App() {
             )}
           </div>
         </div>
+
+        {/* Mobile Navigation Bar for Authenticated Users */}
+        {currentUser && (
+          <div className="md:hidden flex items-center justify-around border-t border-zinc-900 px-4 py-2 bg-zinc-950/90 text-xs font-bold">
+            {isAdmin && (
+              <button
+                onClick={() => setActiveView('admin')}
+                className={`py-1.5 px-3 rounded-lg ${activeView === 'admin' ? 'bg-red-500/20 text-red-400' : 'text-zinc-400'}`}
+              >
+                Admin
+              </button>
+            )}
+            <button
+              onClick={() => setActiveView('dashboard')}
+              className={`py-1.5 px-3 rounded-lg ${activeView === 'dashboard' ? 'bg-emerald-500/20 text-emerald-400' : 'text-zinc-400'}`}
+            >
+              My Profile
+            </button>
+            <button
+              onClick={() => setActiveView('pairing')}
+              className={`py-1.5 px-3 rounded-lg ${activeView === 'pairing' ? 'bg-emerald-500/20 text-emerald-400' : 'text-zinc-400'}`}
+            >
+              Pairing Gateway
+            </button>
+          </div>
+        )}
       </header>
 
       {/* Main Dynamic Viewport */}
       <main className={`flex-1 bg-gradient-to-b ${mainBg} relative transition-colors duration-200`}>
-        {isAdmin ? (
-          /* Render full control admin panel */
+        {activeView === 'admin' && isAdmin && (
           <AdminPanel 
-            currentUser={currentUser!} 
+            currentUser={currentUser} 
             authToken={authToken!} 
             onLogout={handleLogout} 
           />
-        ) : (
-          /* Render default device linking gateway for general guests and regular users */
+        )}
+
+        {activeView === 'dashboard' && currentUser && authToken && (
+          <Dashboard 
+            currentUser={currentUser} 
+            authToken={authToken} 
+            onLogout={handleLogout} 
+            theme={theme}
+          />
+        )}
+
+        {(activeView === 'pairing' || !currentUser) && (
           <LandingPage 
             onLoginClick={() => setShowAuthModal(true)} 
             currentUser={currentUser}
@@ -177,3 +301,4 @@ export default function App() {
     </div>
   );
 }
+

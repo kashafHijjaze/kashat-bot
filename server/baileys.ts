@@ -3,7 +3,7 @@ import pino from 'pino';
 import fs from 'fs';
 import path from 'path';
 import { Boom } from '@hapi/boom';
-import { getSessions, saveSessions, addLog, Session, getAntiDelete, getFirestoreDb, isFirestoreQuotaExhausted, handleFirestoreError, isUserBanned } from './db';
+import { getSessions, saveSessions, addLog, Session, getAntiDelete, getFirestoreDb, isFirestoreQuotaExhausted, handleFirestoreError, isUserBanned, addAdminNotification } from './db';
 import { handleIncomingMessage, handleDeletedMessage, unwrapMessage, getGroupPermissions, cleanJid } from './commands';
 import { collection, doc, getDocs, setDoc, deleteDoc, query, where, getDoc } from 'firebase/firestore';
 
@@ -40,6 +40,7 @@ export function setIoInstance(io: any) {
 const lastSyncedContents = new Map<string, Map<string, string>>();
 const syncQueues = new Map<string, SessionSyncQueue>();
 const reconnectAttempts = new Map<string, number>();
+const initializingUsers = new Set<string>();
 
 class SessionSyncQueue {
   private userId: string;
@@ -471,7 +472,15 @@ export async function disconnectWhatsApp(userId: string, email: string) {
   }
 
   addLog(userId, email, 'disconnect', 'WhatsApp session disconnected and files cleared.');
+  const notif = addAdminNotification({
+    type: 'session_disconnect',
+    title: 'Session Disconnected',
+    message: `WhatsApp session disconnected for ${email}`,
+    userEmail: email,
+    userId
+  });
   if (ioInstance) {
+    ioInstance.to('admin').emit('admin-notification', notif);
     ioInstance.to('admin').emit('admin-log-update', {
       id: 'log_' + Math.random().toString(36).substr(2, 9),
       userId,
@@ -491,266 +500,284 @@ export async function initWhatsAppSession(
   phoneToPair?: string,
   forceRestoreFromCloud: boolean = false
 ): Promise<any> {
-  const sessionPath = getSessionPath(userId);
-  const credsPath = path.join(sessionPath, 'creds.json');
-  
-  // Restore pre-existing files from cloud Firestore only if local credentials do not exist OR forceRestoreFromCloud is true
-  if (!fs.existsSync(credsPath) || forceRestoreFromCloud) {
-    await syncSessionFromFirestore(userId);
-  } else {
-    console.log(`[SessionSync] Local session files exist for ${userId}. Skipping cloud restore during socket initialization.`);
+  if (initializingUsers.has(userId)) {
+    console.log(`[Baileys] Socket initialization already in progress for user ${userId}. Returning existing active socket instance.`);
+    return activeSockets.get(userId);
   }
 
-  const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+  initializingUsers.add(userId);
 
-  // Intercept credentials and key updates to synchronize with Firestore
-  const customSaveCreds = async () => {
-    await saveCreds();
-    await syncSingleFileToFirestore(userId, 'creds.json');
-    triggerSessionSyncToFirestore(userId);
-  };
-
-  const originalSetKeys = state.keys.set;
-  state.keys.set = async (data: any) => {
-    await originalSetKeys(data);
-    triggerSessionSyncToFirestore(userId);
-  };
-
-  let version: any = [2, 3000, 1017004407]; // Modern stable Baileys version fallback
   try {
-    const latest = await fetchLatestBaileysVersion();
-    if (latest && latest.version) {
-      version = latest.version;
+    const sessionPath = getSessionPath(userId);
+    const credsPath = path.join(sessionPath, 'creds.json');
+    
+    // Restore pre-existing files from cloud Firestore only if local credentials do not exist OR forceRestoreFromCloud is true
+    if (!fs.existsSync(credsPath) || forceRestoreFromCloud) {
+      console.log(`[Session Load] Local creds.json missing or cloud sync forced for user ${userId} (${email}). Syncing from cloud storage...`);
+      await syncSessionFromFirestore(userId);
+    } else {
+      console.log(`[Session Load] Loaded valid multi-file auth state for user ${userId} (${email}). creds.json verified locally.`);
     }
-  } catch (err) {
-    console.warn('[Baileys] Failed to fetch latest version, using fallback:', err);
-  }
 
-  // If there's an existing socket, clean it up first and remove all listeners to prevent ghost reconnection loops
-  const existingSock = activeSockets.get(userId);
-  if (existingSock) {
+    const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+
+    // Intercept credentials and key updates to synchronize with Firestore immediately
+    const customSaveCreds = async () => {
+      await saveCreds();
+      console.log(`[Session Save] Authentication state updated and saved to creds.json for user ${userId} (${email}).`);
+      await syncSingleFileToFirestore(userId, 'creds.json');
+      triggerSessionSyncToFirestore(userId);
+    };
+
+    const originalSetKeys = state.keys.set;
+    state.keys.set = async (data: any) => {
+      await originalSetKeys(data);
+      triggerSessionSyncToFirestore(userId);
+    };
+
+    let version: any = [2, 3000, 1017004407]; // Modern stable Baileys version fallback
     try {
-      existingSock.ev.removeAllListeners('connection.update');
-      existingSock.ev.removeAllListeners('creds.update');
-      existingSock.end(undefined);
-    } catch (e) {}
-    activeSockets.delete(userId);
-  }
-
-  const sock = makeWASocket({
-    version,
-    printQRInTerminal: false,
-    auth: state,
-    logger: pino({ level: 'silent' }) as any,
-    browser: Browsers ? Browsers.ubuntu('Chrome') : ['Ubuntu', 'Chrome', '20.0.04'],
-    syncFullHistory: false,
-    shouldSyncHistoryMessage: () => false,
-    connectTimeoutMs: 60000,
-    defaultQueryTimeoutMs: 60000,
-    keepAliveIntervalMs: 25000,
-    markOnlineOnConnect: true,
-    getMessage: async () => undefined
-  });
-
-  activeSockets.set(userId, sock);
-
-  // Update database status to connecting
-  const sessions = getSessions();
-  const sessionIndex = sessions.findIndex(s => s.userId === userId);
-  const updatedSession: Session = {
-    userId,
-    email,
-    status: 'connecting',
-    phone: phoneToPair || (sessionIndex !== -1 ? sessions[sessionIndex].phone : undefined)
-  };
-
-  if (sessionIndex === -1) {
-    sessions.push(updatedSession);
-  } else {
-    sessions[sessionIndex] = updatedSession;
-  }
-  saveSessions(sessions);
-
-  if (ioInstance) {
-    ioInstance.to(userId).emit('wa-status', { status: 'connecting' });
-    ioInstance.to('admin').emit('admin-session-update', { userId, status: 'connecting', email });
-  }
-
-  sock.ev.on('creds.update', customSaveCreds);
-
-  sock.ev.on('messages.upsert', async (m) => {
-    for (const msg of m.messages) {
-      handleIncomingMessage(sock, msg, userId, email).catch(err => {
-        console.error('Error handling incoming WhatsApp message:', err);
-      });
+      const latest = await fetchLatestBaileysVersion();
+      if (latest && latest.version) {
+        version = latest.version;
+      }
+    } catch (err) {
+      console.warn('[Baileys] Failed to fetch latest version, using fallback:', err);
     }
-  });
 
-  sock.ev.on('messages.update', async (updates) => {
-    const antiDeleteEnabled = getAntiDelete(userId);
-    if (!antiDeleteEnabled) return;
+    // If there's an existing socket, clean it up first and remove all listeners to prevent ghost reconnection loops
+    const existingSock = activeSockets.get(userId);
+    if (existingSock) {
+      try {
+        existingSock.ev.removeAllListeners('connection.update');
+        existingSock.ev.removeAllListeners('creds.update');
+        existingSock.end(undefined);
+      } catch (e) {}
+      activeSockets.delete(userId);
+    }
 
-    for (const update of updates) {
-      // 1. Check for protocolMessage revoke inside update or update.update
-      const messageContent = (update as any).message || update.update?.message;
-      const unwrappedUpdate = unwrapMessage(messageContent);
-      const proto = unwrappedUpdate?.protocolMessage;
-      const isProtoRevoke = proto && (proto.type === 3 || proto.type === 'REVOKE');
+    const sock = makeWASocket({
+      version,
+      printQRInTerminal: false,
+      auth: state,
+      logger: pino({ level: 'silent' }) as any,
+      browser: ['Hijjaze Bot', 'Chrome', '120.0.0'],
+      syncFullHistory: false,
+      shouldSyncHistoryMessage: () => false,
+      connectTimeoutMs: 60000,
+      defaultQueryTimeoutMs: 60000,
+      keepAliveIntervalMs: 25000,
+      markOnlineOnConnect: true,
+      getMessage: async () => undefined
+    });
 
-      // 2. Check for messageStubType revoke inside update.update
-      const stubType = update.update?.messageStubType as any;
-      const isStubRevoke = stubType === 1 || stubType === 'REVOKE' || stubType === 28 || stubType === 68 || stubType === 118;
+    activeSockets.set(userId, sock);
 
-      if (isProtoRevoke || isStubRevoke) {
-        const deletedId = isProtoRevoke ? proto.key?.id : update.key?.id;
-        const chatJid = isProtoRevoke ? (proto.key?.remoteJid || update.key?.remoteJid) : update.key?.remoteJid;
-        const deletedByOwner = isProtoRevoke ? !!proto.key?.fromMe : !!update.key?.fromMe;
+    // Update database status to connecting
+    const sessions = getSessions();
+    const sessionIndex = sessions.findIndex(s => s.userId === userId);
+    const updatedSession: Session = {
+      userId,
+      email,
+      status: 'connecting',
+      phone: phoneToPair || (sessionIndex !== -1 ? sessions[sessionIndex].phone : undefined)
+    };
 
-        if (deletedId && chatJid) {
-          console.log(`[AntiDelete] Revocation detected in messages.update. Deleted ID: ${deletedId}, Chat ID: ${chatJid}, Proto: ${!!isProtoRevoke}, Stub: ${!!isStubRevoke}, Owner: ${deletedByOwner}`);
-          handleDeletedMessage(sock, userId, deletedId, email, chatJid, deletedByOwner).catch(err => {
-            console.error('Error handling delete in messages.update:', err);
-          });
+    if (sessionIndex === -1) {
+      sessions.push(updatedSession);
+    } else {
+      sessions[sessionIndex] = updatedSession;
+    }
+    saveSessions(sessions);
+
+    if (ioInstance) {
+      ioInstance.to(userId).emit('wa-status', { status: 'connecting' });
+      ioInstance.to('admin').emit('admin-session-update', { userId, status: 'connecting', email });
+    }
+
+    sock.ev.on('creds.update', customSaveCreds);
+
+    sock.ev.on('messages.upsert', async (m) => {
+      for (const msg of m.messages) {
+        handleIncomingMessage(sock, msg, userId, email).catch(err => {
+          console.error('Error handling incoming WhatsApp message:', err);
+        });
+      }
+    });
+
+    sock.ev.on('messages.update', async (updates) => {
+      const antiDeleteEnabled = getAntiDelete(userId);
+      if (!antiDeleteEnabled) return;
+
+      for (const update of updates) {
+        // 1. Check for protocolMessage revoke inside update or update.update
+        const messageContent = (update as any).message || update.update?.message;
+        const unwrappedUpdate = unwrapMessage(messageContent);
+        const proto = unwrappedUpdate?.protocolMessage;
+        const isProtoRevoke = proto && (proto.type === 3 || proto.type === 'REVOKE');
+
+        // 2. Check for messageStubType revoke inside update.update
+        const stubType = update.update?.messageStubType as any;
+        const isStubRevoke = stubType === 1 || stubType === 'REVOKE' || stubType === 28 || stubType === 68 || stubType === 118;
+
+        if (isProtoRevoke || isStubRevoke) {
+          const deletedId = isProtoRevoke ? proto.key?.id : update.key?.id;
+          const chatJid = isProtoRevoke ? (proto.key?.remoteJid || update.key?.remoteJid) : update.key?.remoteJid;
+          const deletedByOwner = isProtoRevoke ? !!proto.key?.fromMe : !!update.key?.fromMe;
+
+          if (deletedId && chatJid) {
+            console.log(`[AntiDelete] Revocation detected in messages.update. Deleted ID: ${deletedId}, Chat ID: ${chatJid}, Proto: ${!!isProtoRevoke}, Stub: ${!!isStubRevoke}, Owner: ${deletedByOwner}`);
+            handleDeletedMessage(sock, userId, deletedId, email, chatJid, deletedByOwner).catch(err => {
+              console.error('Error handling delete in messages.update:', err);
+            });
+          }
         }
       }
-    }
-  });
+    });
 
-  sock.ev.on('group-participants.update', async (update) => {
-    const { id, participants, action } = update;
-    if (action === 'add') {
-      for (const p of participants) {
-        const pJid = cleanJid(p);
-        if (isUserBanned(id, pJid)) {
-          console.log(`[Ban Enforcement] Banned user ${pJid} joined or was added to group ${id}. Enforcing ban...`);
-          try {
-            const ownerJid = cleanJid(sock.user?.id || '');
-            const perm = await getGroupPermissions(sock, id, ownerJid, true);
-            if (perm.isBotAdmin) {
-              await sock.groupParticipantsUpdate(id, [pJid], 'remove');
-              await sock.sendMessage(id, {
-                text: `🚨 *AUTOMATIC BAN ENFORCEMENT*\n\nUser @${pJid.split('@')[0]} is banned from this group and was automatically removed.`,
-                mentions: [pJid]
-              });
+    sock.ev.on('group-participants.update', async (update) => {
+      const { id, participants, action } = update;
+      if (action === 'add') {
+        for (const p of participants) {
+          const pJid = cleanJid(p);
+          if (isUserBanned(id, pJid)) {
+            console.log(`[Ban Enforcement] Banned user ${pJid} joined or was added to group ${id}. Enforcing ban...`);
+            try {
+              const ownerJid = cleanJid(sock.user?.id || '');
+              const perm = await getGroupPermissions(sock, id, ownerJid, true);
+              if (perm.isBotAdmin) {
+                await sock.groupParticipantsUpdate(id, [pJid], 'remove');
+                await sock.sendMessage(id, {
+                  text: `🚨 *AUTOMATIC BAN ENFORCEMENT*\n\nUser @${pJid.split('@')[0]} is banned from this group and was automatically removed.`,
+                  mentions: [pJid]
+                });
+              }
+            } catch (err) {
+              console.error('[Ban Enforcement Event Error]', err);
             }
-          } catch (err) {
-            console.error('[Ban Enforcement Event Error]', err);
           }
         }
       }
-    }
-  });
+    });
 
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update;
 
-    if (qr && useQr) {
-      console.log(`QR generated for ${userId}`);
-      if (ioInstance) {
-        ioInstance.to(userId).emit('wa-status', { status: 'qr', qr });
-        ioInstance.to('admin').emit('admin-session-update', { userId, status: 'qr', qr, email });
-      }
-    }
-
-    if (connection === 'close') {
-      // Check if this socket has been superseded or removed from activeSockets.
-      // If activeSockets.get(userId) is not this exact socket, we should ignore this event.
-      const currentSock = activeSockets.get(userId);
-      if (currentSock !== sock) {
-        console.log(`Ignoring close event for non-active or superseded socket of user ${userId}`);
-        return;
-      }
-
-      const err = lastDisconnect?.error;
-      const errStr = err ? (err.message || String(err)) : '';
-      const causeStr = (err as any)?.cause ? ((err as any).cause.message || String((err as any).cause)) : '';
-      let isQrTimeout = errStr.includes('QR refs attempts ended') || causeStr.includes('QR refs attempts ended');
-      
-      if (!isQrTimeout && err) {
-        try {
-          const jsonStr = JSON.stringify(err);
-          if (jsonStr.includes('QR refs attempts ended')) {
-            isQrTimeout = true;
-          }
-        } catch (e) {}
-      }
-      
-      const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
-      const cleanReason = (errStr || causeStr || `Status code ${statusCode}` || 'Disconnected').replace(/^Error:\s*/i, '');
-      console.log(`Connection closed for ${userId}, reason: ${cleanReason}, statusCode: ${statusCode}, isQrTimeout: ${isQrTimeout}`);
-      
-      if (activeSockets.get(userId) === sock) {
-        activeSockets.delete(userId);
-      }
-
-      if (isQrTimeout) {
-        console.log(`[Connection] QR pairing timed out for ${userId}. Setting status to disconnected (credentials preserved).`);
-        const currentSessions = getSessions();
-        const index = currentSessions.findIndex(s => s.userId === userId);
-        if (index !== -1 && currentSessions[index].status === 'connecting') {
-          currentSessions[index].status = 'disconnected';
-          saveSessions(currentSessions);
+      if (qr && useQr) {
+        console.log(`QR generated for ${userId}`);
+        if (ioInstance) {
+          ioInstance.to(userId).emit('wa-status', { status: 'qr', qr });
+          ioInstance.to('admin').emit('admin-session-update', { userId, status: 'qr', qr, email });
         }
+      }
+
+      if (connection === 'close') {
+        // Check if this socket has been superseded or removed from activeSockets.
+        // If activeSockets.get(userId) is not this exact socket, we should ignore this event.
+        const currentSock = activeSockets.get(userId);
+        if (currentSock !== sock) {
+          console.log(`Ignoring close event for non-active or superseded socket of user ${userId}`);
+          return;
+        }
+
+        const err = lastDisconnect?.error;
+        const errStr = err ? (err.message || String(err)) : '';
+        const causeStr = (err as any)?.cause ? ((err as any).cause.message || String((err as any).cause)) : '';
+        let isQrTimeout = errStr.includes('QR refs attempts ended') || causeStr.includes('QR refs attempts ended');
+        
+        if (!isQrTimeout && err) {
+          try {
+            const jsonStr = JSON.stringify(err);
+            if (jsonStr.includes('QR refs attempts ended')) {
+              isQrTimeout = true;
+            }
+          } catch (e) {}
+        }
+        
+        const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
+        const cleanReason = (errStr || causeStr || `Status code ${statusCode}` || 'Disconnected').replace(/^Error:\s*/i, '');
+        console.log(`[Connection Disconnect] Connection closed for user ${userId} (${email}). Reason: ${cleanReason}, statusCode: ${statusCode}, isQrTimeout: ${isQrTimeout}`);
+        
+        if (activeSockets.get(userId) === sock) {
+          activeSockets.delete(userId);
+        }
+
+        if (isQrTimeout) {
+          console.log(`[Connection] QR pairing timed out for ${userId}. Setting status to disconnected (credentials preserved).`);
+          const currentSessions = getSessions();
+          const index = currentSessions.findIndex(s => s.userId === userId);
+          if (index !== -1 && currentSessions[index].status === 'connecting') {
+            currentSessions[index].status = 'disconnected';
+            saveSessions(currentSessions);
+          }
+          if (ioInstance) {
+            const baseUserId = userId.split('_')[0];
+            ioInstance.to(userId).emit('wa-status', { status: 'disconnected', message: 'QR pairing expired.' });
+            if (baseUserId !== userId) {
+              ioInstance.to(baseUserId).emit('wa-status', { status: 'disconnected', message: 'QR pairing expired.' });
+            }
+            ioInstance.to('admin').emit('admin-session-update', { userId, status: 'disconnected', email });
+          }
+          addLog(userId, email, 'qr_timeout', 'WhatsApp pairing code expired.');
+          return;
+        }
+
+        // Handle explicit device logouts / unlinking (StatusCode 401 / DisconnectReason.loggedOut or 403)
+        if (statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 403) {
+          console.log(`[Logged Out] User ${userId} (${email}) logged out or unlinked from WhatsApp device. StatusCode: ${statusCode}.`);
+          addLog(userId, email, 'logged_out', 'WhatsApp account logged out or unlinked from mobile device. Disconnecting session.');
+          await disconnectWhatsApp(userId, email);
+          return;
+        }
+
+        // CRITICAL: NEVER DELETE SESSION FILES ON TEMPORARY CONNECTION DROPS!
+        // Schedule automatic reconnection retry loop with exponential backoff
+        const attempts = reconnectAttempts.get(userId) || 0;
+        reconnectAttempts.set(userId, attempts + 1);
+
+        const delayMs = Math.min(3000 * Math.pow(1.3, Math.min(attempts, 10)), 30000);
+        console.log(`[Reconnection] Scheduling automatic reconnect attempt ${attempts + 1} for ${userId} (${email}) in ${Math.round(delayMs)}ms...`);
+
         if (ioInstance) {
           const baseUserId = userId.split('_')[0];
-          ioInstance.to(userId).emit('wa-status', { status: 'disconnected', message: 'QR pairing expired.' });
+          const statusPayload = { status: 'connecting', message: `Reconnecting to WhatsApp (Attempt ${attempts + 1})...` };
+          ioInstance.to(userId).emit('wa-status', statusPayload);
           if (baseUserId !== userId) {
-            ioInstance.to(baseUserId).emit('wa-status', { status: 'disconnected', message: 'QR pairing expired.' });
+            ioInstance.to(baseUserId).emit('wa-status', statusPayload);
           }
-          ioInstance.to('admin').emit('admin-session-update', { userId, status: 'disconnected', email });
+          ioInstance.to('admin').emit('admin-session-update', { userId, status: 'connecting', message: `Reconnecting...`, email });
         }
-        addLog(userId, email, 'qr_timeout', 'WhatsApp pairing code expired.');
-        return;
-      }
 
-      // CRITICAL: NEVER DELETE SESSION FILES ON CONNECTION CLOSE!
-      // Schedule automatic reconnection retry loop with exponential backoff
-      const attempts = reconnectAttempts.get(userId) || 0;
-      reconnectAttempts.set(userId, attempts + 1);
+        await delay(delayMs);
 
-      const delayMs = Math.min(3000 * Math.pow(1.3, Math.min(attempts, 10)), 30000);
-      console.log(`[Reconnection] Scheduling automatic reconnect attempt ${attempts + 1} for ${userId} in ${Math.round(delayMs)}ms...`);
-
-      if (ioInstance) {
-        const baseUserId = userId.split('_')[0];
-        const statusPayload = { status: 'connecting', message: `Reconnecting to WhatsApp (Attempt ${attempts + 1})...` };
-        ioInstance.to(userId).emit('wa-status', statusPayload);
-        if (baseUserId !== userId) {
-          ioInstance.to(baseUserId).emit('wa-status', statusPayload);
+        // Verify if a newer socket session was established during the delay
+        if (activeSockets.has(userId) && activeSockets.get(userId) !== sock) {
+          console.log(`A newer active session exists for user ${userId} during reconnect delay. Aborting older reconnect loop.`);
+          return;
         }
-        ioInstance.to('admin').emit('admin-session-update', { userId, status: 'connecting', message: `Reconnecting...`, email });
-      }
 
-      await delay(delayMs);
-
-      // Verify if a newer socket session was established during the delay
-      if (activeSockets.has(userId) && activeSockets.get(userId) !== sock) {
-        console.log(`A newer active session exists for user ${userId} during reconnect delay. Aborting older reconnect loop.`);
-        return;
-      }
-
-      initWhatsAppSession(userId, email, useQr).catch(reconnectErr => {
-        console.error(`[Reconnection Error] Failed to re-initialize session for ${userId}:`, reconnectErr);
-      });
-    } else if (connection === 'open') {
-      reconnectAttempts.delete(userId);
-      let connectedPhone = '';
-      if (sock.user?.id) {
-        const normalized = jidNormalizedUser(sock.user.id);
-        if (normalized.endsWith('@s.whatsapp.net')) {
-          connectedPhone = normalized.split('@')[0];
-        } else {
-          // If it is a LID or other JID, check if session already has a phone number
-          const currentSessions = getSessions();
-          const existingSess = currentSessions.find(s => s.userId === userId);
-          if (existingSess && existingSess.phone) {
-            connectedPhone = existingSess.phone;
-          } else {
+        initWhatsAppSession(userId, email, useQr).catch(reconnectErr => {
+          console.error(`[Reconnection Error] Failed to re-initialize session for ${userId}:`, reconnectErr);
+        });
+      } else if (connection === 'open') {
+        reconnectAttempts.delete(userId);
+        let connectedPhone = '';
+        if (sock.user?.id) {
+          const normalized = jidNormalizedUser(sock.user.id);
+          if (normalized.endsWith('@s.whatsapp.net')) {
             connectedPhone = normalized.split('@')[0];
+          } else {
+            // If it is a LID or other JID, check if session already has a phone number
+            const currentSessions = getSessions();
+            const existingSess = currentSessions.find(s => s.userId === userId);
+            if (existingSess && existingSess.phone) {
+              connectedPhone = existingSess.phone;
+            } else {
+              connectedPhone = normalized.split('@')[0];
+            }
           }
         }
-      }
-      console.log(`WhatsApp connected successfully for ${userId}: ${connectedPhone}`);
+        console.log(`[Successful Connection] WhatsApp connected successfully for ${userId} (${email}): +${connectedPhone}`);
 
       // Update Session DB
       const currentSessions = getSessions();
@@ -793,10 +820,18 @@ export async function initWhatsAppSession(
       }
 
       addLog(userId, email, 'connect', `WhatsApp successfully linked and online: +${connectedPhone}`);
+      const connectNotif = addAdminNotification({
+        type: 'session_connect',
+        title: 'Session Connected',
+        message: `WhatsApp session connected for ${email}${connectedPhone ? ` (+${connectedPhone})` : ''}`,
+        userEmail: email,
+        userId
+      });
       
       // Force sync session state to Firestore on successful connection open to ensure we have valid credentials backed up
       await syncSessionToFirestore(userId);
       if (ioInstance) {
+        ioInstance.to('admin').emit('admin-notification', connectNotif);
         ioInstance.to('admin').emit('admin-log-update', {
           id: 'log_' + Math.random().toString(36).substr(2, 9),
           userId,
@@ -857,7 +892,12 @@ export async function initWhatsAppSession(
     }
   });
 
+  initializingUsers.delete(userId);
   return sock;
+} catch (err) {
+  initializingUsers.delete(userId);
+  throw err;
+}
 }
 
 // Generate pairing code for phone number

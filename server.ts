@@ -39,7 +39,19 @@ import {
   getLogs, 
   addLog, 
   User,
-  loadFromFirestore
+  loadFromFirestore,
+  getUserProfile,
+  updateUserProfileInfo,
+  getUserStatus,
+  setUserStatus,
+  getAllUserProfiles,
+  deleteUserAccount,
+  getAdminNotifications,
+  addAdminNotification,
+  markAdminNotificationRead,
+  markAllAdminNotificationsRead,
+  deleteAdminNotification,
+  clearAllAdminNotifications
 } from './server/db';
 
 import {
@@ -73,6 +85,16 @@ setIoInstance(io);
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Service & Render Health Check Route
+app.get(['/api/health', '/health', '/healthz'], (req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'Hijjaze Bot WhatsApp Engine',
+    uptime: Math.floor(process.uptime()),
+    timestamp: new Date().toISOString()
+  });
+});
 
 // Helper to encrypt session IDs (just simple hex encoding of user credential mapping for demo)
 function encryptSessionId(userId: string): string {
@@ -143,6 +165,18 @@ app.post('/api/auth/register', (req, res) => {
     saveUsers(users);
 
     addLog(newUser.id, newUser.email, 'register', `Successfully registered account: ${name}`);
+
+    // Create and emit Admin Notification
+    const regNotif = addAdminNotification({
+      type: 'user_register',
+      title: 'New User Registered',
+      message: `${name} (${newUser.email}) registered a new account.`,
+      userEmail: newUser.email,
+      userId: newUser.id
+    });
+    if (io) {
+      io.to('admin').emit('admin-notification', regNotif);
+    }
 
     const token = jwt.sign(
       { id: newUser.id, email: newUser.email, role: newUser.role, name: newUser.name },
@@ -245,6 +279,18 @@ app.post('/api/auth/google', async (req, res) => {
       users.push(user);
       saveUsers(users);
       addLog(user.id, user.email, 'google_register', `Registered with Google: ${user.name}`);
+
+      // Create and emit Admin Notification
+      const googleNotif = addAdminNotification({
+        type: 'user_register',
+        title: 'New User Registered (Google)',
+        message: `${user.name} (${user.email}) registered via Google.`,
+        userEmail: user.email,
+        userId: user.id
+      });
+      if (io) {
+        io.to('admin').emit('admin-notification', googleNotif);
+      }
     } else {
       // Update existing account information and check for admin eligibility
       user.googleId = googleId || user.googleId;
@@ -266,6 +312,76 @@ app.post('/api/auth/google', async (req, res) => {
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Internal server error' });
+  }
+});
+
+
+// --- USER PROFILE & ACCOUNT DASHBOARD ENDPOINTS ---
+
+// Fetch User Profile and Usage Statistics
+app.get('/api/user/profile', authenticateToken, async (req: any, res) => {
+  try {
+    const sessionId = getSessionId(req);
+    const profile = getUserProfile(sessionId, req.user.email, req.user.name);
+    
+    // Check session status
+    const sessions = getSessions();
+    let session = sessions.find(s => s.userId === sessionId);
+    const hasCreds = await hasSavedSession(sessionId);
+    if (hasCreds && (!session || session.status === 'disconnected')) {
+      session = {
+        userId: sessionId,
+        email: req.user.email,
+        status: 'connected'
+      };
+    }
+
+    res.json({
+      profile,
+      user: {
+        id: req.user.id,
+        email: req.user.email,
+        name: req.user.name,
+        role: req.user.role,
+        avatarUrl: req.user.avatarUrl
+      },
+      session: session || { status: 'disconnected' }
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to retrieve profile' });
+  }
+});
+
+// Update User Profile Details
+app.put('/api/user/profile', authenticateToken, (req: any, res) => {
+  try {
+    const sessionId = getSessionId(req);
+    const { name, avatarUrl } = req.body;
+    const updated = updateUserProfileInfo(sessionId, { name, avatarUrl });
+    
+    // Also sync user name in cachedUsers
+    const users = getUsers();
+    const userIndex = users.findIndex(u => u.id === req.user.id);
+    if (userIndex !== -1) {
+      if (name) users[userIndex].name = name;
+      if (avatarUrl) users[userIndex].avatarUrl = avatarUrl;
+      saveUsers(users);
+    }
+
+    res.json({ success: true, profile: updated });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to update profile' });
+  }
+});
+
+// Logout Dashboard UI Session
+app.post('/api/user/logout', authenticateToken, (req: any, res) => {
+  try {
+    const sessionId = getSessionId(req);
+    addLog(sessionId, req.user.email, 'user_logout', `User ${req.user.email} signed out of dashboard UI`);
+    res.json({ success: true, message: 'Logged out of UI session successfully' });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to logout UI session' });
   }
 });
 
@@ -415,14 +531,201 @@ app.get('/api/whatsapp/groups', authenticateToken, async (req: any, res) => {
 
 // --- ADMIN MANAGEMENT PANEL ENDPOINTS ---
 
-// Get Users List (Admin)
+// Get Enhanced Users List with Profiles & Stats (Admin)
 app.get('/api/admin/users', authenticateAdmin, (req, res) => {
   try {
-    const users = getUsers().map(u => {
+    const users = getUsers();
+    const sessions = getSessions();
+    const profiles = getAllUserProfiles();
+
+    const enhancedUsers = users.map(u => {
       const { passwordHash, ...safeUser } = u;
-      return safeUser;
+      const profile = profiles.find(p => p.userId === u.id) || getUserProfile(u.id, u.email, u.name);
+      const session = sessions.find(s => s.userId === u.id);
+      return {
+        ...safeUser,
+        profile,
+        sessionStatus: session?.status || 'disconnected',
+        whatsappPhone: session?.phone || profile.whatsappPhone || null,
+        accountStatus: profile.status || u.status || 'active'
+      };
     });
-    res.json(users);
+
+    res.json(enhancedUsers);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get System-Wide Analytics (Admin)
+app.get('/api/admin/analytics', authenticateAdmin, (req, res) => {
+  try {
+    const users = getUsers();
+    const sessions = getSessions();
+    const profiles = getAllUserProfiles();
+
+    const totalUsers = users.length;
+    const activeSessions = sessions.filter(s => s.status === 'connected').length;
+
+    let totalCommands = 0;
+    let totalAiRequests = 0;
+    let totalDownloads = 0;
+    let totalImagesGenerated = 0;
+    let totalAudioDownloads = 0;
+    let totalVideoDownloads = 0;
+    let mostActiveUser = 'N/A';
+    let maxUserCmds = 0;
+
+    const globalCommandCounts: Record<string, number> = {};
+
+    profiles.forEach(p => {
+      totalCommands += p.totalCommands || 0;
+      totalAiRequests += p.totalAiRequests || 0;
+      totalDownloads += p.totalDownloads || 0;
+      totalImagesGenerated += p.totalImagesGenerated || 0;
+      totalAudioDownloads += p.totalAudioDownloads || 0;
+      totalVideoDownloads += p.totalVideoDownloads || 0;
+
+      if ((p.totalCommands || 0) > maxUserCmds) {
+        maxUserCmds = p.totalCommands;
+        mostActiveUser = p.name || p.email;
+      }
+
+      if (p.commandCounts) {
+        for (const [cmd, count] of Object.entries(p.commandCounts)) {
+          globalCommandCounts[cmd] = (globalCommandCounts[cmd] || 0) + count;
+        }
+      }
+    });
+
+    let topCommand = 'N/A';
+    let topCmdCount = 0;
+    for (const [cmd, count] of Object.entries(globalCommandCounts)) {
+      if (count > topCmdCount) {
+        topCmdCount = count;
+        topCommand = cmd;
+      }
+    }
+
+    const todayStr = new Date().toISOString().split('T')[0];
+    const newUsersToday = users.filter(u => u.createdAt && u.createdAt.startsWith(todayStr)).length;
+
+    res.json({
+      totalUsers,
+      activeSessions,
+      totalCommands,
+      totalAiRequests,
+      totalDownloads,
+      totalImagesGenerated,
+      totalAudioDownloads,
+      totalVideoDownloads,
+      mostActiveUser,
+      mostUsedCommand: topCommand,
+      newUsersToday,
+      globalCommandCounts
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Update User Account Status (Active / Suspended / Blocked)
+app.post('/api/admin/users/:userId/status', authenticateAdmin, (req: any, res) => {
+  try {
+    const targetUserId = req.params.userId;
+    const { status } = req.body; // 'active' | 'suspended' | 'blocked'
+    if (!['active', 'suspended', 'blocked'].includes(status)) {
+      return res.status(400).json({ error: 'Invalid account status' });
+    }
+
+    const updatedProfile = setUserStatus(targetUserId, status);
+    addLog(req.user.id, req.user.email, 'admin_update_status', `Set user ${targetUserId} status to ${status}`);
+    res.json({ success: true, profile: updatedProfile });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete User Account Completely (Admin)
+app.delete('/api/admin/users/:userId', authenticateAdmin, async (req: any, res) => {
+  try {
+    const targetUserId = req.params.userId;
+    deleteUserAccount(targetUserId);
+    await disconnectWhatsApp(targetUserId, 'admin_delete');
+    addLog(req.user.id, req.user.email, 'admin_delete_user', `Deleted user account and session for ${targetUserId}`);
+    res.json({ success: true, message: 'User account and associated session completely deleted' });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Force Logout User Session (Admin)
+app.post('/api/admin/users/:userId/force-logout', authenticateAdmin, (req: any, res) => {
+  try {
+    const targetUserId = req.params.userId;
+    addLog(req.user.id, req.user.email, 'admin_force_logout', `Force logged out user ${targetUserId}`);
+    res.json({ success: true, message: `User ${targetUserId} has been force logged out from UI` });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Fetch Detailed User Activity History (Admin)
+app.get('/api/admin/users/:userId/history', authenticateAdmin, (req: any, res) => {
+  try {
+    const targetUserId = req.params.userId;
+    const profile = getUserProfile(targetUserId);
+    const userLogs = getLogs().filter(l => l.userId === targetUserId);
+    res.json({
+      profile,
+      logs: userLogs
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Export Users & Profiles Data (Admin)
+app.get('/api/admin/users/export', authenticateAdmin, (req: any, res) => {
+  try {
+    const format = req.query.format || 'json';
+    const users = getUsers();
+    const profiles = getAllUserProfiles();
+    const sessions = getSessions();
+
+    const exportData = users.map(u => {
+      const profile = profiles.find(p => p.userId === u.id) || getUserProfile(u.id);
+      const session = sessions.find(s => s.userId === u.id);
+      return {
+        id: u.id,
+        name: u.name,
+        email: u.email,
+        role: u.role,
+        createdAt: u.createdAt,
+        whatsappPhone: session?.phone || profile.whatsappPhone || 'Not paired',
+        sessionStatus: session?.status || 'disconnected',
+        accountStatus: profile.status || 'active',
+        totalCommands: profile.totalCommands || 0,
+        mostUsedCommand: profile.mostUsedCommand || 'None',
+        totalAiRequests: profile.totalAiRequests || 0,
+        totalDownloads: profile.totalDownloads || 0,
+        totalImagesGenerated: profile.totalImagesGenerated || 0,
+        lastActive: profile.lastActive || 'N/A'
+      };
+    });
+
+    if (format === 'csv') {
+      const headers = Object.keys(exportData[0] || {}).join(',');
+      const rows = exportData.map(row => Object.values(row).map(val => `"${String(val).replace(/"/g, '""')}"`).join(','));
+      const csv = [headers, ...rows].join('\n');
+      res.setHeader('Content-disposition', 'attachment; filename=users_export.csv');
+      res.setHeader('Content-type', 'text/csv');
+      return res.send(csv);
+    }
+
+    res.setHeader('Content-disposition', 'attachment; filename=users_export.json');
+    res.setHeader('Content-type', 'application/json');
+    res.send(JSON.stringify(exportData, null, 2));
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -515,6 +818,52 @@ app.get('/api/admin/logs', authenticateAdmin, (req, res) => {
   }
 });
 
+// Admin Notifications Endpoints
+app.get('/api/admin/notifications', authenticateAdmin, (req, res) => {
+  try {
+    const notifications = getAdminNotifications();
+    res.json(notifications);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/admin/notifications/:id/read', authenticateAdmin, (req, res) => {
+  try {
+    markAdminNotificationRead(req.params.id);
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/admin/notifications/read-all', authenticateAdmin, (req, res) => {
+  try {
+    markAllAdminNotificationsRead();
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/admin/notifications/:id', authenticateAdmin, (req, res) => {
+  try {
+    deleteAdminNotification(req.params.id);
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/admin/notifications', authenticateAdmin, (req, res) => {
+  try {
+    clearAllAdminNotifications();
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 // --- REAL-TIME COMMUNICATIONS (SOCKET.IO) ---
 io.on('connection', (socket) => {
@@ -525,12 +874,27 @@ io.on('connection', (socket) => {
     socket.join(userId);
     console.log(`Socket client ${socket.id} joined room ${userId}`);
     
+    // If user is admin, auto-join 'admin' room
+    const users = getUsers();
+    const foundUser = users.find(u => u.id === userId || u.email === userId);
+    if (foundUser && foundUser.role === 'admin') {
+      socket.join('admin');
+      console.log(`Admin socket client ${socket.id} joined room 'admin'`);
+    } else if (userId === 'admin') {
+      socket.join('admin');
+    }
+
     // Send immediate state if exists
     const sessions = getSessions();
     const session = sessions.find(s => s.userId === userId);
     if (session) {
       socket.emit('wa-status', session);
     }
+  });
+
+  socket.on('join-admin', () => {
+    socket.join('admin');
+    console.log(`Socket client ${socket.id} explicitly joined room 'admin'`);
   });
 
   socket.on('disconnect', () => {

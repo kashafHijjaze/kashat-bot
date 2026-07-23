@@ -16,7 +16,9 @@ import {
   banUser,
   unbanUser,
   isUserBanned,
-  getBanRecord
+  getBanRecord,
+  getUserStatus,
+  trackCommandUsage
 } from './db';
 import fs from 'fs';
 import path from 'path';
@@ -3910,6 +3912,24 @@ export async function handleIncomingMessage(sock: any, msg: any, userId: string,
       console.log(`[Mute Enforcement] Muted user ${senderJid} attempted to use command .${cmdName} in ${chatJid}. Command ignored.`);
       return;
     }
+  }
+
+  // Enforce account status (active / suspended / blocked)
+  const userStatus = getUserStatus(userId);
+  if (userStatus === 'suspended' || userStatus === 'blocked') {
+    console.log(`[Account Status] User ${userId} (${email}) account is ${userStatus}. Command .${cmdName} blocked.`);
+    if (userStatus === 'blocked') return;
+    await wrappedSock.sendMessage(chatJid, {
+      text: `⚠️ *ACCOUNT ${userStatus.toUpperCase()}*\n\nYour account is currently ${userStatus} by system administrator. Bot commands are temporarily disabled.`
+    }, { quoted: msg });
+    return;
+  }
+
+  // Automatically track command usage statistics
+  try {
+    trackCommandUsage(userId, email, command.name, command.category, chatJid);
+  } catch (trackErr) {
+    console.error('Error tracking command usage:', trackErr);
   }
 
   // Execute command
